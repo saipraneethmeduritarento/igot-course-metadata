@@ -1,0 +1,174 @@
+import re
+
+import pytest
+
+from src.prompts import RESOURCE_METADATA_SYSTEM_PROMPT
+from src.resource_metadata_extraction import (
+    ResourceSkippedError,
+    clean_video_transcript,
+    fetch_user_prompt,
+    save_metadata_file,
+)
+from src.resource_metadata_schema import ResourceMetadata
+
+PROMPT_EXAMPLE = re.search(r"```json\n(.*?)\n```", RESOURCE_METADATA_SYSTEM_PROMPT, re.S).group(1)
+
+
+class FakeConnection:
+    """Stands in for a psycopg2 connection whose query returns one fixed row."""
+
+    def __init__(self, row):
+        self.row = row
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def cursor(self):
+        return self
+
+    def execute(self, query, params):
+        pass
+
+    def fetchone(self):
+        return self.row
+
+
+def test_prompt_contains_both_transcripts():
+    prompt = fetch_user_prompt(FakeConnection(("video text", "audio text")), "do_1")
+    assert prompt.startswith("resource_id: do_1")
+    assert "<video_transcript>\nvideo text\n</video_transcript>" in prompt
+    assert "<audio_transcript>\naudio text\n</audio_transcript>" in prompt
+
+
+def test_prompt_leaves_out_missing_transcript():
+    prompt = fetch_user_prompt(FakeConnection((None, "audio text")), "do_1")
+    assert "video_transcript" not in prompt
+    assert "<audio_transcript>" in prompt
+
+
+def test_resource_without_transcripts_is_skipped():
+    with pytest.raises(ResourceSkippedError):
+        fetch_user_prompt(FakeConnection(("  ", None)), "do_1")
+
+
+def test_unknown_resource_is_skipped():
+    with pytest.raises(ResourceSkippedError):
+        fetch_user_prompt(FakeConnection(None), "do_1")
+
+
+def test_metadata_file_is_named_after_the_resource_id(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.resource_metadata_extraction.RESOURCE_METADATA_OUTPUT_DIR", tmp_path / "out")
+    metadata = ResourceMetadata.model_validate_json(PROMPT_EXAMPLE)
+
+    save_metadata_file("do_1", metadata)
+
+    saved = ResourceMetadata.model_validate_json((tmp_path / "out" / "do_1.json").read_text())
+    assert saved == metadata
+
+
+def test_clean_video_transcript_removes_segment_markers_and_extra_spaces():
+    text = "**[Segment: Video Time: 0 - 6 sec]** The video  introduces\n  X. **[Segment: Video Time: 6 - 11 sec]** Next."
+    assert clean_video_transcript(text) == "The video introduces X. Next."
+
+
+def test_clean_video_transcript_keeps_other_square_brackets():
+    assert clean_video_transcript("**[Segment: Video Time: 0 - 6 sec]** See [Section 20(7)]") == "See [Section 20(7)]"
+
+
+def test_clean_video_transcript_handles_missing_text():
+    assert clean_video_transcript(None) == ""
+
+
+def test_prompt_uses_cleaned_video_transcript():
+    prompt = fetch_user_prompt(FakeConnection(("**[Segment: Video Time: 0 - 6 sec]** hello", "spoken")), "do_1")
+    assert "<video_transcript>\nhello\n</video_transcript>" in prompt
+    assert "Segment" not in prompt
+
+
+@pytest.mark.parametrize("marker", ["[Segment: Video Time: 1 - 2 sec]", "**[Segment: Video Time: 1 - 2 sec]", "[Segment: Video Time: 1 - 2 sec]**"])
+def test_clean_video_transcript_removes_marker_variants(marker):
+    assert clean_video_transcript(f"{marker} Hello") == "Hello"
+
+
+# --- process_batch / extract_resource_metadata with fakes -----------------------------------------
+
+import asyncio  # noqa: E402
+
+from src import resource_metadata_extraction as extraction  # noqa: E402
+
+
+class FakeLLM:
+    """Returns the example metadata for the resource in each prompt; "do_bad" fails."""
+
+    async def agenerate_many(self, user_prompts, output_model):
+        results = []
+        for prompt in user_prompts:
+            resource_id = prompt.split()[1]
+            if resource_id == "do_bad":
+                results.append(RuntimeError("model failed"))
+            else:
+                example = ResourceMetadata.model_validate_json(PROMPT_EXAMPLE)
+                results.append(example.model_copy(update={"resource_id": resource_id}))
+        return results
+
+
+@pytest.fixture
+def stubbed_io(monkeypatch):
+    """Replace the database and file writes; record which resources get saved."""
+    saved = []
+
+    def fake_fetch(connection, resource_id):
+        if resource_id == "do_missing":
+            raise ResourceSkippedError("resource not found")
+        return f"resource_id: {resource_id}"
+
+    monkeypatch.setattr(extraction, "fetch_user_prompt", fake_fetch)
+    monkeypatch.setattr(extraction, "save_metadata", lambda conn, rid, metadata: saved.append(rid))
+    monkeypatch.setattr(extraction, "save_metadata_file", lambda rid, metadata: None)
+    return saved
+
+
+def test_process_batch_saves_successes_and_survives_skips_and_failures(stubbed_io):
+    count = asyncio.run(
+        extraction.process_batch(None, FakeLLM(), ["do_1", "do_missing", "do_bad", "do_2"])
+    )
+    assert count == 2
+    assert stubbed_io == ["do_1", "do_2"]
+
+
+def test_extract_resource_metadata_runs_in_batches(stubbed_io, monkeypatch):
+    class FakeConnection:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    connection = FakeConnection()
+    monkeypatch.setattr(extraction, "BATCH_SIZE", 2)
+    monkeypatch.setattr(extraction.psycopg2, "connect", lambda dsn: connection)
+    monkeypatch.setattr(extraction, "load_db_dsn", lambda: "dsn")
+    monkeypatch.setattr(extraction, "load_llm_settings", lambda: type("S", (), {"max_concurrency": 1})())
+    monkeypatch.setattr(extraction, "build_system_prompt", lambda: "system")
+    monkeypatch.setattr(extraction, "GeminiProvider", lambda settings, system_prompt: None)
+    monkeypatch.setattr(extraction, "LLMClient", lambda provider, max_concurrency: FakeLLM())
+
+    asyncio.run(extraction.extract_resource_metadata(["do_1", "do_2", "do_3"]))
+
+    assert stubbed_io == ["do_1", "do_2", "do_3"]
+    assert connection.closed
+
+
+def test_extract_resource_metadata_does_nothing_when_no_resources_are_pending(monkeypatch):
+    class FakeConnection:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(extraction.psycopg2, "connect", lambda dsn: FakeConnection())
+    monkeypatch.setattr(extraction, "load_db_dsn", lambda: "dsn")
+    monkeypatch.setattr(extraction, "find_pending_resource_ids", lambda connection: [])
+    monkeypatch.setattr(extraction, "build_system_prompt", lambda: pytest.fail("cache must not be built"))
+
+    asyncio.run(extraction.extract_resource_metadata(None))

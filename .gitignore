@@ -1,0 +1,10 @@
+.env
+.creds/
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+data/input/
+data/output/
+logs/
