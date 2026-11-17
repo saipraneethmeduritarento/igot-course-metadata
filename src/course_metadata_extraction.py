@@ -187,10 +187,13 @@ def collect_resource_info(resources: list[Resource]) -> dict:
     }
 
 
-def collect_reference_resources(resources: list[Resource]) -> list[str]:
-    """Every reference of every resource, without duplicates, in order of first appearance."""
-    references = (reference for resource in resources for reference in resource["reference_resources"] or [])
-    return list(dict.fromkeys(references))
+def collect_reference_resources(resources: list[Resource]) -> list[dict]:
+    """Every reference of every resource, without duplicate values, in order of first appearance."""
+    references: dict[str, dict] = {}
+    for resource in resources:
+        for reference in resource["reference_resources"] or []:
+            references.setdefault(reference["value"], reference)
+    return list(references.values())
 
 
 # --- Step 4: duration-weighted decisions -------------------------------------------------------

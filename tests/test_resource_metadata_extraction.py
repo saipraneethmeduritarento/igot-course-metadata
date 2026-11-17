@@ -39,7 +39,7 @@ class FakeConnection:
 
 def test_prompt_contains_both_transcripts():
     prompt = fetch_user_prompt(FakeConnection(("video text", "audio text")), "do_1")
-    assert prompt.startswith("resource_id: do_1")
+    assert "resource_id" not in prompt
     assert "<video_transcript>\nvideo text\n</video_transcript>" in prompt
     assert "<audio_transcript>\naudio text\n</audio_transcript>" in prompt
 
@@ -111,8 +111,7 @@ class FakeLLM:
             if resource_id == "do_bad":
                 results.append(RuntimeError("model failed"))
             else:
-                example = ResourceMetadata.model_validate_json(PROMPT_EXAMPLE)
-                results.append(example.model_copy(update={"resource_id": resource_id}))
+                results.append(ResourceMetadata.model_validate_json(PROMPT_EXAMPLE))
         return results
 
 
@@ -198,3 +197,11 @@ def test_clean_designations_expands_compact_form_and_drops_invalid():
         "Additional Superintendent of Police (Armed Reserve)",
     ]
     assert all(r.confidence == 0.8 for r in cleaned)
+
+
+def test_prompt_example_keys_follow_schema_order():
+    import json
+
+    example = json.loads(PROMPT_EXAMPLE)
+    assert list(example) == list(ResourceMetadata.model_fields)
+    assert list(example["sto_level"]) == ["evidence", "rationale", "value", "confidence"]

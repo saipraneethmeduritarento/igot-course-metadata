@@ -50,8 +50,8 @@ RESOURCE_IDS = [
 
 BATCH_SIZE = 20  # resources sent to the model together; results are saved after each batch
 
-# One table column per ResourceMetadata field (except resource_id, which identifies the row).
-METADATA_COLUMNS = [name for name in ResourceMetadata.model_fields if name != "resource_id"]
+# One table column per ResourceMetadata field. The model never returns resource_id: code owns it.
+METADATA_COLUMNS = list(ResourceMetadata.model_fields)
 TEXT_COLUMNS = {"course_summary", "description"}  # every other metadata column is JSONB
 
 # Matches `[Segment: Video Time: ...]`, with or without the surrounding `**`.
@@ -120,13 +120,12 @@ def fetch_user_prompt(connection: Connection, resource_id: str) -> str:
         "video_transcript": clean_video_transcript(video_transcript),
         "audio_transcript": (audio_transcript or "").strip(),
     }
-    transcript_blocks = [f"<{name}>\n{text}\n</{name}>" for name, text in transcripts.items() if text]
-    if not transcript_blocks:
+    present = {name: text for name, text in transcripts.items() if text}
+    if not present:
         raise ResourceSkippedError("no usable transcript")
 
-    return RESOURCE_METADATA_USER_PROMPT.format(
-        resource_id=resource_id, transcripts="\n\n".join(transcript_blocks)
-    )
+    transcript_blocks = [f"<{name}>\n{text}\n</{name}>" for name, text in present.items()]
+    return RESOURCE_METADATA_USER_PROMPT.format(transcripts="\n\n".join(transcript_blocks))
 
 
 # --- Calling the model -------------------------------------------------------------------------
@@ -167,14 +166,16 @@ def clean_designations(
     return list(cleaned.values())
 
 
-def validate_designations(metadata: ResourceMetadata, valid_names: frozenset[str]) -> ResourceMetadata:
+def validate_designations(
+    metadata: ResourceMetadata, valid_names: frozenset[str], resource_id: str
+) -> ResourceMetadata:
     """Return the metadata with only valid designations, and none in both role lists."""
-    roles = clean_designations(metadata.target_roles, valid_names, metadata.resource_id, "target_roles")
+    roles = clean_designations(metadata.target_roles, valid_names, resource_id, "target_roles")
     role_names = {role.name for role in roles}
     exclusions = [
         role
         for role in clean_designations(
-            metadata.target_roles_exclusions, valid_names, metadata.resource_id, "target_roles_exclusions"
+            metadata.target_roles_exclusions, valid_names, resource_id, "target_roles_exclusions"
         )
         if role.name not in role_names
     ]
@@ -232,10 +233,7 @@ async def process_batch(connection: Connection, llm: LLMClient, resource_ids: li
         if isinstance(result, Exception):
             logger.error("Extraction failed for %s: %r", resource_id, result)
             continue
-        if result.resource_id != resource_id:
-            logger.error("Model returned resource_id %s for %s", result.resource_id, resource_id)
-            continue
-        result = validate_designations(result, valid_names)
+        result = validate_designations(result, valid_names, resource_id)
         try:
             save_metadata(connection, resource_id, result)
             save_metadata_file(resource_id, result)
