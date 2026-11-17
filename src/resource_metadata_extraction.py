@@ -18,8 +18,8 @@ from psycopg2.extras import Json
 from src.config import RESOURCE_METADATA_OUTPUT_DIR, load_db_dsn, load_llm_settings
 from src.llm import GeminiProvider, LLMClient
 from src.prompts import RESOURCE_METADATA_SYSTEM_PROMPT, RESOURCE_METADATA_USER_PROMPT
-from src.reference_data import load_designations, load_kcm_catalogue, load_sgos_tree
-from src.resource_metadata_schema import ResourceMetadata
+from src.reference_data import load_designation_names, load_designations, load_kcm_catalogue, load_sgos_tree
+from src.resource_metadata_schema import Designation, ResourceMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ BATCH_SIZE = 20  # resources sent to the model together; results are saved after
 
 # One table column per ResourceMetadata field (except resource_id, which identifies the row).
 METADATA_COLUMNS = [name for name in ResourceMetadata.model_fields if name != "resource_id"]
-TEXT_COLUMNS = {"course_summary"}  # every other metadata column is JSONB
+TEXT_COLUMNS = {"course_summary", "description"}  # every other metadata column is JSONB
 
 # Matches `[Segment: Video Time: ...]`, with or without the surrounding `**`.
 SEGMENT_MARKER = re.compile(r"(?:\*\*)?\[Segment:[^\]]*\](?:\*\*)?")
@@ -66,13 +66,23 @@ class ResourceSkippedError(Exception):
 
 
 def find_pending_resource_ids(connection: Connection) -> list[str]:
-    """Resources that have no metadata yet."""
+    """Resources that have no metadata yet and have at least one transcript.
+
+    Resources without any transcript are left out (they are never sent to the model);
+    how many were left out is logged.
+    """
+    has_transcript = "(btrim(COALESCE(video_transcript, '')) <> '' OR btrim(COALESCE(audio_transcript, '')) <> '')"
     with connection, connection.cursor() as cursor:
         cursor.execute(
-            "SELECT resource_id FROM public.resource_transcripts "
+            f"SELECT resource_id, {has_transcript} FROM public.resource_transcripts "
             "WHERE course_summary IS NULL ORDER BY resource_id"
         )
-        return [row[0] for row in cursor.fetchall()]
+        rows = cursor.fetchall()
+
+    pending = [resource_id for resource_id, has in rows if has]
+    if len(pending) < len(rows):
+        logger.info("Left out %d resources with no transcript.", len(rows) - len(pending))
+    return pending
 
 
 # --- Building the prompts ----------------------------------------------------------------------
@@ -129,6 +139,48 @@ async def extract_metadata(
     return await llm.agenerate_many(user_prompts, ResourceMetadata)
 
 
+# --- Checking designations ---------------------------------------------------------------------
+
+COMPACT_FORM = re.compile(r"^(?P<base>[^()]+?) \((?P<qualifiers>[^()]* \| [^()]*)\)$")
+
+
+def clean_designations(
+    roles: list[Designation], valid_names: frozenset[str], resource_id: str, field: str
+) -> list[Designation]:
+    """Keep only valid designation names.
+
+    A compact `Base (A | B)` answer is expanded into `Base (A)`, `Base (B)` (each keeps the
+    confidence and rationale). Any name that is still not in the list is dropped. Duplicates are removed.
+    """
+    cleaned: dict[str, Designation] = {}
+    for role in roles:
+        name = role.name.strip()
+        candidates = [name]
+        match = COMPACT_FORM.match(name)
+        if match:
+            candidates = [f"{match['base']} ({q.strip()})" for q in match["qualifiers"].split("|")]
+        for candidate in candidates:
+            if candidate in valid_names:
+                cleaned.setdefault(candidate, role.model_copy(update={"name": candidate}))
+            else:
+                logger.warning("Dropped invalid designation %r in %s for %s", candidate, field, resource_id)
+    return list(cleaned.values())
+
+
+def validate_designations(metadata: ResourceMetadata, valid_names: frozenset[str]) -> ResourceMetadata:
+    """Return the metadata with only valid designations, and none in both role lists."""
+    roles = clean_designations(metadata.target_roles, valid_names, metadata.resource_id, "target_roles")
+    role_names = {role.name for role in roles}
+    exclusions = [
+        role
+        for role in clean_designations(
+            metadata.target_roles_exclusions, valid_names, metadata.resource_id, "target_roles_exclusions"
+        )
+        if role.name not in role_names
+    ]
+    return metadata.model_copy(update={"target_roles": roles, "target_roles_exclusions": exclusions})
+
+
 # --- Saving the results ------------------------------------------------------------------------
 
 
@@ -174,6 +226,7 @@ async def process_batch(connection: Connection, llm: LLMClient, resource_ids: li
 
     results = await extract_metadata(llm, list(prompts.values()))
 
+    valid_names = load_designation_names()
     saved = 0
     for resource_id, result in zip(prompts, results):
         if isinstance(result, Exception):
@@ -182,6 +235,7 @@ async def process_batch(connection: Connection, llm: LLMClient, resource_ids: li
         if result.resource_id != resource_id:
             logger.error("Model returned resource_id %s for %s", result.resource_id, resource_id)
             continue
+        result = validate_designations(result, valid_names)
         try:
             save_metadata(connection, resource_id, result)
             save_metadata_file(resource_id, result)

@@ -1,18 +1,26 @@
 import json
 import re
 
+import pytest
+
 from src.course_metadata_extraction import (
-    METADATA_COLUMNS,
+    COURSE_COLUMNS,
+    RESOURCE_COLUMNS,
+    CourseSkippedError,
     TEXT_FIELDS,
     build_course_metadata,
+    build_keywords_list,
     build_user_prompt,
     collect_languages,
+    collect_resource_info,
     collect_reference_resources,
+    fetch_course_resources,
     fill_missing_durations,
     roll_up_resources,
 )
 from src.course_metadata_schema import CourseMetadata, CourseTextMetadata
 from src.prompts import COURSE_METADATA_SYSTEM_PROMPT
+from src.resource_metadata_schema import Keyword
 
 PROMPT_EXAMPLE = re.search(r"```json\n(.*?)\n```", COURSE_METADATA_SYSTEM_PROMPT, re.S).group(1)
 
@@ -32,7 +40,7 @@ def resource(resource_id, duration, area="Domain", level="Operational", **overri
     """A resource with complete metadata. Pass fields to override."""
     row = {
         "resource_id": resource_id, "duration_in_sec": duration, "source_language": None, "source_languages": None,
-        "presenters": [], "course_summary": "summary", "keywords": [], "reference_resources": [],
+        "presenters": [], "course_summary": "summary", "description": "d", "learning_outcomes": [], "keywords": [], "reference_resources": [],
         "learning_level": judged("Beginner"), "learning_mode": judged("Online"),
         "prerequisites": [], "bloom_taxonomy": [],
         "primary_competency_area": judged(area),
@@ -55,20 +63,35 @@ def test_prompt_example_matches_text_schema_and_key_order():
 
 def test_code_and_text_fields_cover_every_course_field():
     rolled_up = roll_up_resources([resource("a", 100)])
-    assert set(rolled_up) | set(TEXT_FIELDS) | {"course_id"} == set(CourseMetadata.model_fields)
-    assert METADATA_COLUMNS == [n for n in CourseMetadata.model_fields if n != "course_id"]
+    built_after_the_model = {"keywords_list"}
+    assert set(rolled_up) | set(TEXT_FIELDS) | built_after_the_model | {"course_id"} == set(CourseMetadata.model_fields)
+    assert COURSE_COLUMNS == [n for n in CourseMetadata.model_fields if n != "course_id"]
 
 
 # --- fields done by code -----------------------------------------------------------------------
 
 
-def test_collect_languages_is_unique_sorted_and_skips_missing():
+def test_languages_are_ordered_by_resource_count_then_regional_before_english():
     resources = [
         resource("a", 10, source_language="Hindi", source_languages=["Hindi"]),
         resource("b", 10, source_language="English", source_languages=["English", "Hindi"]),
-        resource("c", 10),
+        resource("c", 10, source_language="Telugu"),
+        resource("d", 10),
     ]
-    assert collect_languages(resources) == ["English", "Hindi"]
+    # Hindi in 2 resources; English and Telugu in 1 each, so the regional Telugu comes before English.
+    assert collect_languages(resources) == ["Hindi", "Telugu", "English"]
+
+
+def test_dominant_language_is_the_first_one_and_tie_prefers_regional_over_english():
+    tied = [resource("a", 10, source_language="English"), resource("b", 10, source_language="Marathi")]
+    assert collect_resource_info(tied)["language"] == "Marathi"
+    both_regional = [resource("a", 10, source_language="Telugu"), resource("b", 10, source_language="Hindi")]
+    assert collect_resource_info(both_regional)["language"] == "Hindi"  # still tied: the first in the list
+
+
+def test_course_without_any_language_has_no_dominant_language():
+    info = collect_resource_info([resource("a", 10)])
+    assert info == {"resource_ids": ["a"], "language": None, "list_of_languages": []}
 
 
 def test_reference_resources_are_deduplicated_in_order():
@@ -194,10 +217,113 @@ def test_user_prompt_has_profile_and_duration_shares_but_no_resource_ids():
 def test_build_course_metadata_joins_code_and_text_fields():
     resources = [resource("a", 100)]
     text = CourseTextMetadata(
-        course_id="c1", presenters=[], course_summary="s", keywords=[], prerequisites=[],
+        course_id="c1", presenters=[], course_summary="s", description="d", learning_outcomes=[],
+        keywords=[], prerequisites=[],
         responsibilities_addressed=[], activities_enabled=[],
     )
     metadata = build_course_metadata("c1", roll_up_resources(resources), text)
     assert metadata.course_id == "c1"
     assert metadata.primary_competency_area.value == "Domain"
     assert metadata.course_summary == "s"
+
+
+# --- keywords_list, rationales and field order -------------------------------------------------
+
+
+def keyword(name, importance, variants):
+    return Keyword(keyword=name, type="Concept", importance=importance, variants=variants)
+
+
+def test_keywords_list_is_sorted_by_importance_with_short_forms_and_variant_counts():
+    keywords = [
+        keyword("phishing", "Low", ["phishing"]),
+        keyword("Quality of Service", "High", ["quality of service", "QoS", "QS", "QOS"]),
+        keyword("QoS flow", "Medium", ["QoS flow", "QoS flows"]),
+    ]
+    assert build_keywords_list(keywords) == [
+        "Quality of Service (QoS, QS) [High, 4 variants]",
+        "QoS flow [Medium, 2 variants]",
+        "phishing [Low, 1 variant]",
+    ]
+
+
+def test_keywords_list_uses_the_expanded_form_when_the_keyword_is_an_acronym():
+    keywords = [keyword("NCRP", "High", ["NCRP", "National Cybercrime Reporting Portal", "Cybercrime Portal"])]
+    assert build_keywords_list(keywords) == ["National Cybercrime Reporting Portal (NCRP) [High, 3 variants]"]
+
+
+def test_rationale_quotes_the_strongest_resources_content():
+    resources = [
+        resource("a", 600, learning_level={**judged("Beginner"), "rationale": "Defines every term from scratch."}),
+        resource("b", 300, learning_level={**judged("Beginner"), "rationale": "Assumes no prior knowledge"}),
+        resource("c", 100, learning_level={**judged("Beginner"), "rationale": "Third resource, not quoted."}),
+    ]
+    rationale = roll_up_resources(resources)["learning_level"]["rationale"]
+    assert "100% of the course duration" in rationale and "across 3 of 3 resources" in rationale
+    assert "(1) Defines every term from scratch. (2) Assumes no prior knowledge." in rationale
+    assert "Third resource" not in rationale
+
+
+def test_hybrid_rationale_quotes_both_parts():
+    resources = [
+        resource("a", 550, learning_mode={**judged("Online"), "rationale": "Pure concepts."}),
+        resource("b", 450, learning_mode={**judged("Offline"), "rationale": "Role-play practice."}),
+    ]
+    rationale = roll_up_resources(resources)["learning_mode"]["rationale"]
+    assert "Online part: Pure concepts." in rationale and "In-person part: Role-play practice." in rationale
+
+
+def test_value_or_identifying_key_comes_before_confidence_and_rationale():
+    resources = [resource("a", 100, area="Functional", functional_competencies=[kcm("F1")])]
+    text = CourseTextMetadata(
+        course_id="c1", presenters=[], course_summary="s", description="d", learning_outcomes=[], keywords=[],
+        prerequisites=[{"topic": "t", "recommended_by": "AI", "confidence": 0.8, "rationale": "r"}],
+        responsibilities_addressed=[], activities_enabled=[],
+    )
+    document = build_course_metadata("c1", roll_up_resources(resources), text).model_dump(mode="json")
+    assert list(document["learning_level"])[:3] == ["value", "confidence", "rationale"]
+    assert list(document["prerequisites"][0])[0] == "topic"
+    assert list(document["functional_competencies"][0])[0] == "competency_id"
+    assert list(document["sto_level"])[:3] == ["value", "confidence", "rationale"]
+
+
+# --- only complete courses are rolled up -------------------------------------------------------
+
+
+class FakeConnection:
+    """Stands in for a psycopg2 connection whose query returns the given resources."""
+
+    def __init__(self, resources):
+        self.columns = ["resource_id", "duration_in_sec", "source_language", "source_languages", *RESOURCE_COLUMNS]
+        self.rows = [tuple(r[column] for column in self.columns) for r in resources]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def cursor(self):
+        return self
+
+    def execute(self, query, params):
+        pass
+
+    def fetchall(self):
+        return self.rows
+
+
+def test_complete_course_is_fetched():
+    resources = [resource("a", 100), resource("b", 200)]
+    assert [r["resource_id"] for r in fetch_course_resources(FakeConnection(resources), "c1")] == ["a", "b"]
+
+
+def test_course_with_a_resource_missing_metadata_is_skipped_and_lists_the_missing_ids():
+    resources = [resource("a", 100), resource("b", 200, course_summary=None), resource("c", 50, course_summary=None)]
+    with pytest.raises(CourseSkippedError, match=r"2 of 3 resources have no metadata yet: b, c"):
+        fetch_course_resources(FakeConnection(resources), "c1")
+
+
+def test_course_with_no_transcribed_resource_is_skipped():
+    with pytest.raises(CourseSkippedError, match="no resource with a transcript"):
+        fetch_course_resources(FakeConnection([]), "c1")

@@ -1,6 +1,7 @@
 """Reference data (KCM, SGOS, designations) formatted as text for the prompts."""
 
 import json
+import re
 from pathlib import Path
 
 from src.config import DESIGNATIONS_PATH, KCM_PATH, SGOS_PATH
@@ -23,8 +24,31 @@ def load_sgos_tree(path: Path = SGOS_PATH) -> str:
 
 
 def load_designations(path: Path = DESIGNATIONS_PATH) -> str:
-    """One designation name per line."""
-    return path.read_text(encoding="utf-8").strip()
+    """Compact designation list: `Base (A | B | C)` stands for `Base (A)`, `Base (B)`, `Base (C)`.
+
+    Names that share a base and differ only in a trailing parenthetical are merged into one line.
+    Names without a trailing parenthetical (including the plain base) stay on their own line.
+    """
+    names = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    groups: dict[str, list[str]] = {}
+    lines: list[tuple[str, bool]] = []  # (text or base, is_group)
+    for name in names:
+        match = None if name.startswith("(") else re.match(r"^([^()]+?) \(([^()|]*)\)$", name)
+        if not match:
+            lines.append((name, False))
+            continue
+        base, qualifier = match.groups()
+        if base not in groups:
+            groups[base] = []
+            lines.append((base, True))
+        if qualifier not in groups[base]:
+            groups[base].append(qualifier)
+    return "\n".join(f"{text} ({' | '.join(groups[text])})" if is_group else text for text, is_group in lines)
+
+
+def load_designation_names(path: Path = DESIGNATIONS_PATH) -> frozenset[str]:
+    """Every valid full designation name, exactly as written in the source file."""
+    return frozenset(line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
 
 
 def _format_competency(competency: dict) -> str:

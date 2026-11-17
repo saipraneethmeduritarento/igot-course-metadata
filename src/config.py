@@ -21,6 +21,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 # Course roll-up thresholds. An item reaches the course only if its share of the course duration
 # (sum of resource duration x confidence, divided by the course duration) is at least this much.
 COURSE_MIN_SHARE = 0.20
+COURSE_RATIONALE_SOURCES = 2  # resources whose own rationale is quoted in a course-level rationale
 COURSE_EXCLUSION_MIN_SHARE = 0.60  # exclusions are stricter: a role is excluded only on strong support
 COURSE_MAX_ITEMS = {
     "behavioural_competencies": 5,

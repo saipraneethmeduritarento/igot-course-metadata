@@ -1,14 +1,16 @@
 """Course-level roll-up of resource-level metadata.
 
 For each course:
-  1. read the metadata of its resources from public.resource_transcripts;
+  1. read the metadata of its resources from public.resource_transcripts. A course is rolled up only
+     when every resource that has a transcript already has metadata, otherwise it is skipped;
   2. decide the course fields that depend on duration IN CODE: each value or item is scored by
      the sum of (resource duration x confidence) over the resources that carry it, divided by the
      course duration. Single-value fields take the highest score; list fields keep the items whose
      score reaches the threshold in src/config.py;
   3. ask the LLM only for the text fields (summary, keywords, presenters, prerequisites,
      responsibilities, activities);
-  4. store one row in public.course_metadata_rollup, and write the full result to
+  4. add the fields built by code: the languages and the formatted `keywords_list`;
+  5. store one row in public.course_metadata_rollup, and write the full result to
      <COURSE_METADATA_OUTPUT_DIR>/<course_id>.json.
 
 Run resource_metadata_extraction first. Then, from the project root:
@@ -18,7 +20,7 @@ Run resource_metadata_extraction first. Then, from the project root:
 import asyncio
 import json
 import logging
-from collections import defaultdict
+from collections import Counter, defaultdict
 
 import psycopg2
 from psycopg2 import sql
@@ -30,13 +32,16 @@ from src.config import (
     COURSE_MAX_ITEMS,
     COURSE_METADATA_OUTPUT_DIR,
     COURSE_MIN_SHARE,
+    COURSE_RATIONALE_SOURCES,
     load_db_dsn,
     load_llm_settings,
 )
 from src.course_metadata_schema import CourseMetadata, CourseTextMetadata
 from src.llm import GeminiProvider, LLMClient
 from src.prompts import COURSE_METADATA_SYSTEM_PROMPT, COURSE_METADATA_USER_PROMPT
-from src.resource_metadata_extraction import METADATA_COLUMNS, TEXT_COLUMNS
+from src.resource_metadata_extraction import METADATA_COLUMNS as RESOURCE_COLUMNS
+from src.resource_metadata_extraction import TEXT_COLUMNS
+from src.resource_metadata_schema import Keyword
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +49,7 @@ Connection = psycopg2.extensions.connection
 Resource = dict  # one row of resource_transcripts: ids, duration, languages and metadata columns
 Entries = list[tuple[int, dict]]  # (resource duration, the resource's judged item) for one value
 
-# Courses to process. Leave empty to process every course that has no roll-up yet.
+# Courses to process. Leave empty to process every complete course that has no roll-up yet.
 COURSE_IDS: list[str] = ["do_11371284946833408012", "do_11360057657171968019"]
 
 BATCH_SIZE = 5  # courses sent to the model together; results are saved after each batch
@@ -52,26 +57,36 @@ BATCH_SIZE = 5  # courses sent to the model together; results are saved after ea
 # The model writes these fields. Code decides all the other CourseMetadata fields.
 TEXT_FIELDS = [name for name in CourseTextMetadata.model_fields if name != "course_id"]
 
-# The roll-up table has the same metadata columns as the resource table: TEXT for the summary, JSONB otherwise.
+# One roll-up column per CourseMetadata field. RESOURCE_COLUMNS are the ones read from the resource table.
+COURSE_COLUMNS = [name for name in CourseMetadata.model_fields if name != "course_id"]
+
+# A resource without any transcript text never gets metadata, so it must not hold its course back.
+HAS_TRANSCRIPT_SQL = sql.SQL("(COALESCE(TRIM(video_transcript), '') <> '' OR COALESCE(TRIM(audio_transcript), '') <> '')")
+
+ENGLISH = "English"
+IMPORTANCE_ORDER = {"High": 0, "Medium": 1, "Low": 2}
+
+# Metadata columns are TEXT for the summary and description, JSONB otherwise.
 CREATE_TABLE_SQL = sql.SQL(
     """
     CREATE TABLE IF NOT EXISTS public.course_metadata_rollup (
-        course_id    TEXT PRIMARY KEY,
-        resource_ids TEXT[] NOT NULL,
-        language     TEXT[] NOT NULL,
+        course_id         TEXT PRIMARY KEY,
+        resource_ids      TEXT[] NOT NULL,
+        language          TEXT,
+        list_of_languages TEXT[] NOT NULL,
         {metadata_columns}
     )
     """
 ).format(
     metadata_columns=sql.SQL(",\n        ").join(
         sql.SQL("{} {}").format(sql.Identifier(column), sql.SQL("TEXT" if column in TEXT_COLUMNS else "JSONB"))
-        for column in METADATA_COLUMNS
+        for column in COURSE_COLUMNS
     )
 )
 
 
 class CourseSkippedError(Exception):
-    """The course cannot be rolled up (no resource with metadata)."""
+    """The course cannot be rolled up yet (no resource with a transcript, or a resource has no metadata)."""
 
 
 # --- Step 1: the table and the courses to process ----------------------------------------------
@@ -84,14 +99,15 @@ def create_rollup_table(connection: Connection) -> None:
 
 
 def find_pending_course_ids(connection: Connection) -> list[str]:
-    """Courses with resource metadata and no roll-up yet."""
+    """Courses with no roll-up yet whose resources (those with a transcript) all have metadata."""
+    query = sql.SQL(
+        "SELECT course_id FROM public.resource_transcripts "
+        "WHERE course_id IS NOT NULL AND {has_transcript} "
+        "AND course_id NOT IN (SELECT course_id FROM public.course_metadata_rollup) "
+        "GROUP BY course_id HAVING bool_and(course_summary IS NOT NULL) ORDER BY course_id"
+    ).format(has_transcript=HAS_TRANSCRIPT_SQL)
     with connection, connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT DISTINCT course_id FROM public.resource_transcripts "
-            "WHERE course_id IS NOT NULL AND course_summary IS NOT NULL "
-            "AND course_id NOT IN (SELECT course_id FROM public.course_metadata_rollup) "
-            "ORDER BY course_id"
-        )
+        cursor.execute(query)
         return [row[0] for row in cursor.fetchall()]
 
 
@@ -99,19 +115,31 @@ def find_pending_course_ids(connection: Connection) -> list[str]:
 
 
 def fetch_course_resources(connection: Connection, course_id: str) -> list[Resource]:
-    """The resources of the course that have metadata."""
-    columns = ["resource_id", "duration_in_sec", "source_language", "source_languages", *METADATA_COLUMNS]
+    """The resources of the course that have a transcript, each with its metadata.
+
+    Raises CourseSkippedError if there are none, or if any of them has no metadata yet (the
+    message lists the missing resource ids).
+    """
+    columns = ["resource_id", "duration_in_sec", "source_language", "source_languages", *RESOURCE_COLUMNS]
     query = sql.SQL(
-        "SELECT {} FROM public.resource_transcripts "
-        "WHERE course_id = %s AND course_summary IS NOT NULL ORDER BY resource_id"
-    ).format(sql.SQL(", ").join(sql.Identifier(column) for column in columns))
+        "SELECT {columns} FROM public.resource_transcripts "
+        "WHERE course_id = %s AND {has_transcript} ORDER BY resource_id"
+    ).format(
+        columns=sql.SQL(", ").join(sql.Identifier(column) for column in columns),
+        has_transcript=HAS_TRANSCRIPT_SQL,
+    )
 
     with connection, connection.cursor() as cursor:
         cursor.execute(query, (course_id,))
         resources = [dict(zip(columns, row)) for row in cursor.fetchall()]
 
     if not resources:
-        raise CourseSkippedError("no resource with metadata")
+        raise CourseSkippedError("no resource with a transcript")
+    missing = [resource["resource_id"] for resource in resources if resource["course_summary"] is None]
+    if missing:
+        raise CourseSkippedError(
+            f"{len(missing)} of {len(resources)} resources have no metadata yet: {', '.join(missing)}"
+        )
     return resources
 
 
@@ -129,18 +157,34 @@ def course_duration(resources: list[Resource]) -> int:
 # --- Step 3: fields copied or combined by code -------------------------------------------------
 
 
-def collect_resource_ids(resources: list[Resource]) -> list[str]:
-    return [resource["resource_id"] for resource in resources]
+def languages_of(resource: Resource) -> set[str]:
+    """The languages of one resource. A resource without a language adds nothing."""
+    languages = set(resource["source_languages"] or [])
+    if resource["source_language"]:
+        languages.add(resource["source_language"])
+    return languages
 
 
 def collect_languages(resources: list[Resource]) -> list[str]:
-    """The unique languages of the resources, sorted. A resource without a language adds nothing."""
-    languages: set[str] = set()
-    for resource in resources:
-        if resource["source_language"]:
-            languages.add(resource["source_language"])
-        languages.update(resource["source_languages"] or [])
-    return sorted(languages)
+    """Every language of the course, the one used by most resources first.
+
+    On a tie a regional language comes before English, then the names are in alphabetical order.
+    """
+    resource_counts = Counter(language for resource in resources for language in languages_of(resource))
+    return sorted(resource_counts, key=lambda language: (-resource_counts[language], language == ENGLISH, language))
+
+
+def collect_resource_info(resources: list[Resource]) -> dict:
+    """The columns that say which resources the course was rolled up from, and in which languages.
+
+    `language` is the dominant language (the first of `list_of_languages`), None if no resource has one.
+    """
+    languages = collect_languages(resources)
+    return {
+        "resource_ids": [resource["resource_id"] for resource in resources],
+        "language": languages[0] if languages else None,
+        "list_of_languages": languages,
+    }
 
 
 def collect_reference_resources(resources: list[Resource]) -> list[str]:
@@ -182,10 +226,19 @@ def rank_groups(groups: dict, resources: list[Resource]) -> list[tuple[float, ob
     return sorted(ranked, key=lambda row: row[0], reverse=True)
 
 
+def strongest_rationales(entries: Entries, limit: int = COURSE_RATIONALE_SOURCES) -> list[str]:
+    """What the resources with the most duration x confidence behind them said about this value."""
+    strongest_first = sorted(entries, key=lambda entry: entry[0] * entry[1]["confidence"], reverse=True)
+    rationales = dict.fromkeys(item["rationale"].strip().rstrip(".") + "." for _, item in strongest_first)
+    return list(rationales)[:limit]
+
+
 def explain(share: float, entries: Entries, resources: list[Resource]) -> str:
+    """The share of the course duration behind a value, then the content from the resources that supports it."""
+    supporting = " ".join(f"({number}) {text}" for number, text in enumerate(strongest_rationales(entries), 1))
     return (
         f"Supported by {share:.0%} of the course duration (duration weighted by confidence), "
-        f"across {len(entries)} of {len(resources)} resources."
+        f"across {len(entries)} of {len(resources)} resources. Supporting content from the resources: {supporting}"
     )
 
 
@@ -211,8 +264,10 @@ def roll_up_learning_mode(resources: list[Resource]) -> dict:
     """
     groups = group_by_value(resources, "learning_mode")
     total = course_duration(resources)
-    online = (support_seconds(groups["Online"]) + support_seconds(groups["Hybrid"])) / total
-    offline = (support_seconds(groups["Offline"]) + support_seconds(groups["Hybrid"])) / total
+    online_entries = groups["Online"] + groups["Hybrid"]
+    offline_entries = groups["Offline"] + groups["Hybrid"]
+    online = support_seconds(online_entries) / total
+    offline = support_seconds(offline_entries) / total
     if min(online, offline) < COURSE_MIN_SHARE:
         return roll_up_single_value(resources, "learning_mode")
     return {
@@ -220,7 +275,9 @@ def roll_up_learning_mode(resources: list[Resource]) -> dict:
         "confidence": round(min(online, offline), 2),
         "rationale": (
             f"Online learning covers {online:.0%} and in-person practice {offline:.0%} of the course duration "
-            "(duration weighted by confidence; Hybrid resources count for both)."
+            "(duration weighted by confidence; Hybrid resources count for both). "
+            f"Online part: {strongest_rationales(online_entries, 1)[0]} "
+            f"In-person part: {strongest_rationales(offline_entries, 1)[0]}"
         ),
     }
 
@@ -354,7 +411,46 @@ def build_user_prompt(course_id: str, resources: list[Resource], rolled_up: dict
     )
 
 
-# --- Step 6: calling the model -----------------------------------------------------------------
+# --- Step 6: the keywords list (built by code from the model's keywords) ----------------------
+
+
+def is_short_form(text: str) -> bool:
+    """An acronym such as "QoS" or "PDU": one word of at most 8 characters with two or more capitals."""
+    return " " not in text and len(text) <= 8 and sum(char.isupper() for char in text) >= 2
+
+
+def split_full_and_short_forms(keyword: Keyword) -> tuple[str, list[str]]:
+    """The full form of a keyword and its short forms (no repeats, ignoring case).
+
+    If the model's keyword is itself an acronym, the longest variant that is not an acronym is the full form.
+    """
+    forms = [keyword.keyword, *keyword.variants]
+    full_form = keyword.keyword
+    if is_short_form(full_form):
+        full_form = max((form for form in forms if not is_short_form(form)), key=len, default=full_form)
+
+    short_forms: dict[str, str] = {}
+    for form in forms:
+        if is_short_form(form):
+            short_forms.setdefault(form.lower(), form)  # the first spelling wins
+    return full_form, [form for lowered, form in short_forms.items() if lowered != full_form.lower()]
+
+
+def format_keyword(keyword: Keyword) -> str:
+    """For example: "Quality of Service (QoS, QS) [High, 7 variants]"."""
+    full_form, short_forms = split_full_and_short_forms(keyword)
+    short_text = f" ({', '.join(short_forms)})" if short_forms else ""
+    variant_count = len(keyword.variants)
+    return f"{full_form}{short_text} [{keyword.importance}, {variant_count} variant{'' if variant_count == 1 else 's'}]"
+
+
+def build_keywords_list(keywords: list[Keyword]) -> list[str]:
+    """Every keyword as one line, High importance first, then Medium, then Low (the model's order within each)."""
+    by_importance = sorted(keywords, key=lambda keyword: IMPORTANCE_ORDER[keyword.importance])
+    return [format_keyword(keyword) for keyword in by_importance]
+
+
+# --- Step 7: calling the model -----------------------------------------------------------------
 
 
 async def write_text_fields(llm: LLMClient, user_prompts: list[str]) -> list[CourseTextMetadata | Exception]:
@@ -363,24 +459,26 @@ async def write_text_fields(llm: LLMClient, user_prompts: list[str]) -> list[Cou
 
 
 def build_course_metadata(course_id: str, rolled_up: dict, text: CourseTextMetadata) -> CourseMetadata:
-    """Join the fields decided by code with the text fields written by the model."""
-    return CourseMetadata(course_id=course_id, **rolled_up, **text.model_dump(exclude={"course_id"}))
+    """Join the fields decided by code with the text fields written by the model, and add `keywords_list`."""
+    return CourseMetadata(
+        course_id=course_id,
+        **rolled_up,
+        keywords_list=build_keywords_list(text.keywords),
+        **text.model_dump(exclude={"course_id"}),
+    )
 
 
-# --- Step 7: saving the results ----------------------------------------------------------------
+# --- Step 8: saving the results ----------------------------------------------------------------
 
 
-def save_rollup(
-    connection: Connection, resource_ids: list[str], languages: list[str], metadata: CourseMetadata
-) -> None:
+def save_rollup(connection: Connection, resource_info: dict, metadata: CourseMetadata) -> None:
     """Insert the course row, or replace it if the course was rolled up before."""
     values = metadata.model_dump(mode="json")
-    columns = ["course_id", "resource_ids", "language", *METADATA_COLUMNS]
+    columns = ["course_id", *resource_info, *COURSE_COLUMNS]
     parameters = [
         metadata.course_id,
-        resource_ids,
-        languages,
-        *(values[c] if c in TEXT_COLUMNS else Json(values[c]) for c in METADATA_COLUMNS),
+        *resource_info.values(),
+        *(values[c] if c in TEXT_COLUMNS else Json(values[c]) for c in COURSE_COLUMNS),
     ]
     query = sql.SQL(
         "INSERT INTO public.course_metadata_rollup ({columns}) VALUES ({placeholders}) "
@@ -396,20 +494,19 @@ def save_rollup(
         cursor.execute(query, parameters)
 
 
-def save_rollup_file(resource_ids: list[str], languages: list[str], metadata: CourseMetadata) -> None:
+def save_rollup_file(resource_info: dict, metadata: CourseMetadata) -> None:
     """Write the full roll-up to <COURSE_METADATA_OUTPUT_DIR>/<course_id>.json."""
     COURSE_METADATA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     document = {
         "course_id": metadata.course_id,
-        "resource_ids": resource_ids,
-        "language": languages,
+        **resource_info,
         **metadata.model_dump(mode="json", exclude={"course_id"}),
     }
     output_path = COURSE_METADATA_OUTPUT_DIR / f"{metadata.course_id}.json"
     output_path.write_text(json.dumps(document, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-# --- Step 8: running ---------------------------------------------------------------------------
+# --- Step 9: running ---------------------------------------------------------------------------
 
 
 def prepare_course(connection: Connection, course_id: str) -> dict:
@@ -418,8 +515,7 @@ def prepare_course(connection: Connection, course_id: str) -> dict:
     fill_missing_durations(resources)
     rolled_up = roll_up_resources(resources)
     return {
-        "resource_ids": collect_resource_ids(resources),
-        "languages": collect_languages(resources),
+        "resource_info": collect_resource_info(resources),
         "rolled_up": rolled_up,
         "prompt": build_user_prompt(course_id, resources, rolled_up),
     }
@@ -427,7 +523,7 @@ def prepare_course(connection: Connection, course_id: str) -> dict:
 
 async def process_batch(connection: Connection, llm: LLMClient, course_ids: list[str]) -> int:
     """Roll up one batch of courses. Returns how many were saved."""
-    courses: dict[str, dict] = {}
+    courses: dict[str, dict] = {}  # course_id -> resource_info, rolled_up and prompt
     for course_id in course_ids:
         try:
             courses[course_id] = prepare_course(connection, course_id)
@@ -448,8 +544,8 @@ async def process_batch(connection: Connection, llm: LLMClient, course_ids: list
             continue
         try:
             metadata = build_course_metadata(course_id, course["rolled_up"], result)
-            save_rollup(connection, course["resource_ids"], course["languages"], metadata)
-            save_rollup_file(course["resource_ids"], course["languages"], metadata)
+            save_rollup(connection, course["resource_info"], metadata)
+            save_rollup_file(course["resource_info"], metadata)
             saved += 1
         except (ValidationError, psycopg2.Error, OSError):
             logger.exception("Could not save %s", course_id)

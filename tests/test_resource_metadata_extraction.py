@@ -5,11 +5,12 @@ import pytest
 from src.prompts import RESOURCE_METADATA_SYSTEM_PROMPT
 from src.resource_metadata_extraction import (
     ResourceSkippedError,
+    clean_designations,
     clean_video_transcript,
     fetch_user_prompt,
     save_metadata_file,
 )
-from src.resource_metadata_schema import ResourceMetadata
+from src.resource_metadata_schema import Designation, ResourceMetadata
 
 PROMPT_EXAMPLE = re.search(r"```json\n(.*?)\n```", RESOURCE_METADATA_SYSTEM_PROMPT, re.S).group(1)
 
@@ -172,3 +173,28 @@ def test_extract_resource_metadata_does_nothing_when_no_resources_are_pending(mo
     monkeypatch.setattr(extraction, "build_system_prompt", lambda: pytest.fail("cache must not be built"))
 
     asyncio.run(extraction.extract_resource_metadata(None))
+
+
+VALID_DESIGNATIONS = frozenset(
+    {"Additional Superintendent of Police", "Additional Superintendent of Police (Civil)",
+     "Additional Superintendent of Police (Armed Reserve)"}
+)
+
+
+def _roles(*names):
+    return [Designation(name=n, confidence=0.8, rationale="r") for n in names]
+
+
+def test_clean_designations_expands_compact_form_and_drops_invalid():
+    roles = _roles(
+        "Additional Superintendent of Police (Civil | Armed Reserve)",
+        "Additional Superintendent of Police (Civil)",
+        "Additional Superintendent of Police (Cyber Crime)",
+        "Made Up Role",
+    )
+    cleaned = clean_designations(roles, VALID_DESIGNATIONS, "do_1", "target_roles")
+    assert [r.name for r in cleaned] == [
+        "Additional Superintendent of Police (Civil)",
+        "Additional Superintendent of Police (Armed Reserve)",
+    ]
+    assert all(r.confidence == 0.8 for r in cleaned)

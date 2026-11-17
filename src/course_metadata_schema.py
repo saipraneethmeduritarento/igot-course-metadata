@@ -1,8 +1,8 @@
 """Output schema for course-level metadata (the roll-up of resource-level metadata).
 
 The fields are the same as ResourceMetadata (src/resource_metadata_schema.py), with
-`course_id` in place of `resource_id`. The `language` and `resource_ids` columns of the
-course_metadata_rollup table are added by code, not by the model, so they are not here.
+`course_id` in place of `resource_id`, plus `keywords_list`. The `resource_ids`, `language` and
+`list_of_languages` columns of the course_metadata_rollup table are added by code, so they are not here.
 CourseTextMetadata mirrors Section 4 of COURSE_METADATA_SYSTEM_PROMPT in src/prompts.py. Keep the two in sync.
 """
 
@@ -30,6 +30,8 @@ class CourseTextMetadata(BaseModel):
     course_id: str
     presenters: list[Presenter]
     course_summary: str
+    description: str
+    learning_outcomes: list[str]
     keywords: list[Keyword]
     prerequisites: list[Prerequisite]
     responsibilities_addressed: list[str]
@@ -42,7 +44,10 @@ class CourseMetadata(BaseModel):
     course_id: str
     presenters: list[Presenter]
     course_summary: str
+    description: str
+    learning_outcomes: list[str]
     keywords: list[Keyword]
+    keywords_list: list[str]  # built by code from `keywords`, see build_keywords_list
     reference_resources: list[str]
     learning_level: LearningLevel
     learning_mode: LearningMode
