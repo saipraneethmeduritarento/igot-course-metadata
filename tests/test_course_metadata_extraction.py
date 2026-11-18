@@ -94,12 +94,16 @@ def test_course_without_any_language_has_no_dominant_language():
     assert info == {"resource_ids": ["a"], "language": None, "list_of_languages": []}
 
 
+def reference(value, type_="URL"):
+    return {"value": value, "type": type_}
+
+
 def test_reference_resources_are_deduplicated_in_order():
     resources = [
-        resource("a", 10, reference_resources=["x", "y"]),
-        resource("b", 10, reference_resources=["y", "z"]),
+        resource("a", 10, reference_resources=[reference("x"), reference("y")]),
+        resource("b", 10, reference_resources=[reference("y", "Portal/App"), reference("z")]),
     ]
-    assert collect_reference_resources(resources) == ["x", "y", "z"]
+    assert collect_reference_resources(resources) == [reference("x"), reference("y"), reference("z")]
 
 
 def test_course_with_no_durations_counts_resources_equally():
@@ -273,7 +277,7 @@ def test_hybrid_rationale_quotes_both_parts():
     assert "Online part: Pure concepts." in rationale and "In-person part: Role-play practice." in rationale
 
 
-def test_value_or_identifying_key_comes_before_confidence_and_rationale():
+def test_rationale_comes_before_value_and_confidence():
     resources = [resource("a", 100, area="Functional", functional_competencies=[kcm("F1")])]
     text = CourseTextMetadata(
         course_id="c1", presenters=[], course_summary="s", description="d", learning_outcomes=[], keywords=[],
@@ -281,10 +285,10 @@ def test_value_or_identifying_key_comes_before_confidence_and_rationale():
         responsibilities_addressed=[], activities_enabled=[],
     )
     document = build_course_metadata("c1", roll_up_resources(resources), text).model_dump(mode="json")
-    assert list(document["learning_level"])[:3] == ["value", "confidence", "rationale"]
+    assert list(document["learning_level"])[:3] == ["rationale", "value", "confidence"]
     assert list(document["prerequisites"][0])[0] == "topic"
     assert list(document["functional_competencies"][0])[0] == "competency_id"
-    assert list(document["sto_level"])[:3] == ["value", "confidence", "rationale"]
+    assert list(document["sto_level"])[:4] == ["evidence", "rationale", "value", "confidence"]
 
 
 # --- only complete courses are rolled up -------------------------------------------------------

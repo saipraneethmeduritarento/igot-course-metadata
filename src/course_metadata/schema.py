@@ -20,6 +20,7 @@ from src.resource_metadata.schema import (
     Prerequisite,
     PrimaryCompetencyArea,
     Presenter,
+    ReferenceResource,
     StoLevelJudgement,
 )
 
@@ -43,12 +44,12 @@ class CourseMetadata(BaseModel):
 
     course_id: str
     presenters: list[Presenter]
-    course_summary: str
     description: str
+    course_summary: str
     learning_outcomes: list[str]
     keywords: list[Keyword]
     keywords_list: list[str]  # built by code from `keywords`, see build_keywords_list
-    reference_resources: list[str]
+    reference_resources: list[ReferenceResource]
     learning_level: LearningLevel
     learning_mode: LearningMode
     prerequisites: list[Prerequisite]
