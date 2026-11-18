@@ -21,12 +21,14 @@ load_dotenv(PROJECT_ROOT / ".env")
 # Course roll-up thresholds. An item reaches the course only if its share of the course duration
 # (sum of resource duration x confidence, divided by the course duration) is at least this much.
 COURSE_MIN_SHARE = 0.20
+# Learning mode: the course time is split into an online part and an in-person part (a Hybrid resource counts
+# half for each). A part below this share does not count: Online if the in-person part is below it, Offline if
+# the online part is below it, otherwise Hybrid.
+COURSE_LEARNING_MODE_MIN_SHARE = 0.35
 COURSE_RATIONALE_SOURCES = 2  # resources whose own rationale is quoted in a course-level rationale
 COURSE_EXCLUSION_MIN_SHARE = 0.60  # exclusions are stricter: a role is excluded only on strong support
+# Competencies are not here: a course has ONE competency, from its primary area.
 COURSE_MAX_ITEMS = {
-    "behavioural_competencies": 5,
-    "functional_competencies": 5,
-    "domain_competencies": 3,
     "bloom_taxonomy": 4,
     "target_employee_groups": 4,
     "target_roles": 10,
