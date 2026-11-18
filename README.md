@@ -5,6 +5,8 @@ Generates course-level and resource-level metadata for iGOT courses using an LLM
 ## Layout
 
 - `src/` – config, LLM client, reference masters, course/resource logic, CLI
+- `src/resource_metadata/` – resource-level metadata (`extraction.py`, `schema.py`)
+- `src/course_metadata/` – course-level metadata (`extraction.py`, `schema.py`)
 - `src/utils/` – shared helpers
 - `src/scripts/` – existing entry-point scripts
 - `prompts/v1/` – prompt templates

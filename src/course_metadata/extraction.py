@@ -13,8 +13,8 @@ For each course:
   5. store one row in public.course_metadata_rollup, and write the full result to
      <COURSE_METADATA_OUTPUT_DIR>/<course_id>.json.
 
-Run resource_metadata_extraction first. Then, from the project root:
-    python -m src.course_metadata_extraction
+Run src.resource_metadata.extraction first. Then, from the project root:
+    python -m src.course_metadata.extraction
 """
 
 import asyncio
@@ -36,12 +36,12 @@ from src.config import (
     load_db_dsn,
     load_llm_settings,
 )
-from src.course_metadata_schema import CourseMetadata, CourseTextMetadata
+from src.course_metadata.schema import CourseMetadata, CourseTextMetadata
 from src.llm import GeminiProvider, LLMClient
 from src.prompts import COURSE_METADATA_SYSTEM_PROMPT, COURSE_METADATA_USER_PROMPT
-from src.resource_metadata_extraction import METADATA_COLUMNS as RESOURCE_COLUMNS
-from src.resource_metadata_extraction import TEXT_COLUMNS
-from src.resource_metadata_schema import Keyword
+from src.resource_metadata.extraction import METADATA_COLUMNS as RESOURCE_COLUMNS
+from src.resource_metadata.extraction import TEXT_COLUMNS
+from src.resource_metadata.schema import Keyword
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,7 @@ Resource = dict  # one row of resource_transcripts: ids, duration, languages and
 Entries = list[tuple[int, dict]]  # (resource duration, the resource's judged item) for one value
 
 # Courses to process. Leave empty to process every complete course that has no roll-up yet.
-COURSE_IDS: list[str] = ["do_11371284946833408012", "do_11360057657171968019"]
+COURSE_IDS: list[str] = ["do_114593386079199232164", "do_1145892947202785281209", "do_11458703148261376011077"]
 
 BATCH_SIZE = 5  # courses sent to the model together; results are saved after each batch
 
@@ -544,8 +544,9 @@ async def process_batch(connection: Connection, llm: LLMClient, course_ids: list
             continue
         try:
             metadata = build_course_metadata(course_id, course["rolled_up"], result)
-            save_rollup(connection, course["resource_info"], metadata)
+            # File first: if the database save fails, the billed response is still kept.
             save_rollup_file(course["resource_info"], metadata)
+            save_rollup(connection, course["resource_info"], metadata)
             saved += 1
         except (ValidationError, psycopg2.Error, OSError):
             logger.exception("Could not save %s", course_id)

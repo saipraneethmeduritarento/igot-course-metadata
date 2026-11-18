@@ -4,7 +4,7 @@ For each resource: read its transcripts from Postgres, ask the LLM for metadata,
 store each metadata field in its own column of the same row,
 and write the full response to <RESOURCE_METADATA_OUTPUT_DIR>/<resource_id>.json.
 
-Run from the project root:  python -m src.resource_metadata_extraction
+Run from the project root:  python -m src.resource_metadata.extraction
 """
 
 import asyncio
@@ -19,7 +19,7 @@ from src.config import RESOURCE_METADATA_OUTPUT_DIR, load_db_dsn, load_llm_setti
 from src.llm import GeminiProvider, LLMClient
 from src.prompts import RESOURCE_METADATA_SYSTEM_PROMPT, RESOURCE_METADATA_USER_PROMPT
 from src.reference_data import load_designation_names, load_designations, load_kcm_catalogue, load_sgos_tree
-from src.resource_metadata_schema import Designation, ResourceMetadata
+from src.resource_metadata.schema import Designation, ResourceMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -27,25 +27,21 @@ Connection = psycopg2.extensions.connection
 
 # Resources to process. Leave empty to process every resource without metadata yet.
 RESOURCE_IDS = [
-    "do_1137567857355489281291",
-    "do_1137567851239751681435",
-    "do_1137567832409784321299",
-    "do_1137567823583232001433",
-    "do_113756779784151040187",
-    "do_1137567793080729601289",
-    "do_113756778891182080185",
-    "do_1137567747670343681287",
-    "do_1137129168580444161100",
-    "do_113712913889419264199",
-    "do_1137129030786007041113",
-    "do_113712901135106048197",
-    "do_1137128938371973121110",
-    "do_113712870807076864195",
-    "do_11371286260652441617",
-    "do_1137128602693468161107",
-    "do_11371285559701504016",
-    "do_11371285322841292814",
-    "do_113712850390204416190",
+    "do_1140017973346959361190",
+    "do_1140018028274892801194",
+    "do_1140018061473218561191",
+    "do_1140018088174878721201",
+    "do_1140018138236928001220",
+    "do_114591950667096064188",
+    "do_1145893775421603841220",
+    "do_11458939814686720011041",
+    "do_11459194269945036811265",
+    "do_11459194483711180811125",
+    "do_1145870344041758721132",
+    "do_1145870360173035521986",
+    "do_11458703232655360011037",
+    "do_11458703370266214411094",
+    "do_11458703705615564811079"
 ]
 
 BATCH_SIZE = 20  # resources sent to the model together; results are saved after each batch
@@ -184,6 +180,23 @@ def validate_designations(metadata: ResourceMetadata, valid_names: frozenset[str
 # --- Saving the results ------------------------------------------------------------------------
 
 
+def ensure_metadata_columns(connection: Connection) -> None:
+    """Add any metadata column resource_transcripts lacks.
+
+    The table is created once by src/utils/load_transcripts_to_postgres.py, so a field added to
+    ResourceMetadata later is missing from existing databases. Run before calling the model, so a
+    missing column cannot waste a billed run.
+    """
+    with connection, connection.cursor() as cursor:
+        for column in METADATA_COLUMNS:
+            column_type = "TEXT" if column in TEXT_COLUMNS else "JSONB"
+            cursor.execute(
+                sql.SQL("ALTER TABLE public.resource_transcripts ADD COLUMN IF NOT EXISTS {} {}").format(
+                    sql.Identifier(column), sql.SQL(column_type)
+                )
+            )
+
+
 def save_metadata(connection: Connection, resource_id: str, metadata: ResourceMetadata) -> None:
     """Store each metadata field in its own column of the resource's row."""
     values = metadata.model_dump(mode="json")
@@ -237,8 +250,9 @@ async def process_batch(connection: Connection, llm: LLMClient, resource_ids: li
             continue
         result = validate_designations(result, valid_names)
         try:
-            save_metadata(connection, resource_id, result)
+            # File first: if the database save fails, the billed response is still kept.
             save_metadata_file(resource_id, result)
+            save_metadata(connection, resource_id, result)
             saved += 1
         except (ResourceSkippedError, psycopg2.Error, OSError):
             logger.exception("Could not save %s", resource_id)
@@ -255,6 +269,7 @@ async def extract_resource_metadata(requested_ids: list[str] | None = None) -> N
             logger.info("No resources to process.")
             return
         logger.info("Processing %d resources", total)
+        ensure_metadata_columns(connection)
 
         # Built after the resources are known: this creates the (billed) prompt cache.
         settings = load_llm_settings()

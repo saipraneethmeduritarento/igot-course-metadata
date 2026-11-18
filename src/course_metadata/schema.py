@@ -1,6 +1,6 @@
 """Output schema for course-level metadata (the roll-up of resource-level metadata).
 
-The fields are the same as ResourceMetadata (src/resource_metadata_schema.py), with
+The fields are the same as ResourceMetadata (src/resource_metadata/schema.py), with
 `course_id` in place of `resource_id`, plus `keywords_list`. The `resource_ids`, `language` and
 `list_of_languages` columns of the course_metadata_rollup table are added by code, so they are not here.
 CourseTextMetadata mirrors Section 4 of COURSE_METADATA_SYSTEM_PROMPT in src/prompts.py. Keep the two in sync.
@@ -8,7 +8,7 @@ CourseTextMetadata mirrors Section 4 of COURSE_METADATA_SYSTEM_PROMPT in src/pro
 
 from pydantic import BaseModel
 
-from src.resource_metadata_schema import (
+from src.resource_metadata.schema import (
     BloomLevel,
     DomainCompetency,
     Designation,

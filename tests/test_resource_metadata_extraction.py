@@ -3,14 +3,14 @@ import re
 import pytest
 
 from src.prompts import RESOURCE_METADATA_SYSTEM_PROMPT
-from src.resource_metadata_extraction import (
+from src.resource_metadata.extraction import (
     ResourceSkippedError,
     clean_designations,
     clean_video_transcript,
     fetch_user_prompt,
     save_metadata_file,
 )
-from src.resource_metadata_schema import Designation, ResourceMetadata
+from src.resource_metadata.schema import Designation, ResourceMetadata
 
 PROMPT_EXAMPLE = re.search(r"```json\n(.*?)\n```", RESOURCE_METADATA_SYSTEM_PROMPT, re.S).group(1)
 
@@ -61,7 +61,7 @@ def test_unknown_resource_is_skipped():
 
 
 def test_metadata_file_is_named_after_the_resource_id(tmp_path, monkeypatch):
-    monkeypatch.setattr("src.resource_metadata_extraction.RESOURCE_METADATA_OUTPUT_DIR", tmp_path / "out")
+    monkeypatch.setattr("src.resource_metadata.extraction.RESOURCE_METADATA_OUTPUT_DIR", tmp_path / "out")
     metadata = ResourceMetadata.model_validate_json(PROMPT_EXAMPLE)
 
     save_metadata_file("do_1", metadata)
@@ -98,7 +98,7 @@ def test_clean_video_transcript_removes_marker_variants(marker):
 
 import asyncio  # noqa: E402
 
-from src import resource_metadata_extraction as extraction  # noqa: E402
+from src.resource_metadata import extraction  # noqa: E402
 
 
 class FakeLLM:
@@ -149,6 +149,7 @@ def test_extract_resource_metadata_runs_in_batches(stubbed_io, monkeypatch):
 
     connection = FakeConnection()
     monkeypatch.setattr(extraction, "BATCH_SIZE", 2)
+    monkeypatch.setattr(extraction, "ensure_metadata_columns", lambda connection: None)
     monkeypatch.setattr(extraction.psycopg2, "connect", lambda dsn: connection)
     monkeypatch.setattr(extraction, "load_db_dsn", lambda: "dsn")
     monkeypatch.setattr(extraction, "load_llm_settings", lambda: type("S", (), {"max_concurrency": 1})())

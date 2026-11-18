@@ -3,7 +3,7 @@ import re
 
 import pytest
 
-from src.course_metadata_extraction import (
+from src.course_metadata.extraction import (
     COURSE_COLUMNS,
     RESOURCE_COLUMNS,
     CourseSkippedError,
@@ -18,9 +18,9 @@ from src.course_metadata_extraction import (
     fill_missing_durations,
     roll_up_resources,
 )
-from src.course_metadata_schema import CourseMetadata, CourseTextMetadata
+from src.course_metadata.schema import CourseMetadata, CourseTextMetadata
 from src.prompts import COURSE_METADATA_SYSTEM_PROMPT
-from src.resource_metadata_schema import Keyword
+from src.resource_metadata.schema import Keyword
 
 PROMPT_EXAMPLE = re.search(r"```json\n(.*?)\n```", COURSE_METADATA_SYSTEM_PROMPT, re.S).group(1)
 

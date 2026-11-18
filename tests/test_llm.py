@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from src.llm import LLMClient
 from src.prompts import RESOURCE_METADATA_SYSTEM_PROMPT
-from src.resource_metadata_schema import ResourceMetadata
+from src.resource_metadata.schema import ResourceMetadata
 
 
 class Answer(BaseModel):
