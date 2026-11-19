@@ -1,8 +1,9 @@
 """Resource-level metadata extraction.
 
-For each resource: read its transcripts from Postgres, ask the LLM for metadata,
-store each metadata field in its own column of the same row,
+For each resource: read its transcripts from public.resource_transcripts, ask the LLM for metadata,
+store one row in public.resource_metadata (one column per metadata field),
 and write the full response to <RESOURCE_METADATA_OUTPUT_DIR>/<resource_id>.json.
+public.resource_transcripts itself is only read, never changed.
 
 Run from the project root:  python -m src.resource_metadata.extraction
 """
@@ -41,10 +42,32 @@ RESOURCE_IDS = [
     "do_1145870360173035521986",
     "do_11458703232655360011037",
     "do_11458703370266214411094",
-    "do_11458703705615564811079"
+    "do_11458703705615564811079",
+    "do_1137567857355489281291",
+    "do_1137567851239751681435",
+    "do_1137567832409784321299",
+    "do_1137567823583232001433",
+    "do_113756779784151040187",
+    "do_1137567793080729601289",
+    "do_113756778891182080185",
+    "do_1137567747670343681287",
+    "do_1137129168580444161100",
+    "do_113712913889419264199",
+    "do_1137129030786007041113",
+    "do_113712901135106048197",
+    "do_1137128938371973121110",
+    "do_113712870807076864195",
+    "do_11371286260652441617",
+    "do_1137128602693468161107",
+    "do_11371285559701504016",
+    "do_11371285322841292814",
+    "do_113712850390204416190"
 ]
 
 BATCH_SIZE = 20  # resources sent to the model together; results are saved after each batch
+
+# Where the metadata is stored: one row per resource, keyed by resource_id.
+METADATA_TABLE = "resource_metadata"
 
 # One table column per ResourceMetadata field. The model never returns resource_id: code owns it.
 METADATA_COLUMNS = list(ResourceMetadata.model_fields)
@@ -67,12 +90,14 @@ def find_pending_resource_ids(connection: Connection) -> list[str]:
     Resources without any transcript are left out (they are never sent to the model);
     how many were left out is logged.
     """
-    has_transcript = "(btrim(COALESCE(video_transcript, '')) <> '' OR btrim(COALESCE(audio_transcript, '')) <> '')"
+    has_transcript = "(btrim(COALESCE(t.video_transcript, '')) <> '' OR btrim(COALESCE(t.audio_transcript, '')) <> '')"
+    query = sql.SQL(
+        "SELECT t.resource_id, " + has_transcript + " FROM public.resource_transcripts t "
+        "WHERE NOT EXISTS (SELECT 1 FROM public.{table} m WHERE m.resource_id = t.resource_id) "
+        "ORDER BY t.resource_id"
+    ).format(table=sql.Identifier(METADATA_TABLE))
     with connection, connection.cursor() as cursor:
-        cursor.execute(
-            f"SELECT resource_id, {has_transcript} FROM public.resource_transcripts "
-            "WHERE course_summary IS NULL ORDER BY resource_id"
-        )
+        cursor.execute(query)
         rows = cursor.fetchall()
 
     pending = [resource_id for resource_id, has in rows if has]
@@ -181,40 +206,76 @@ def validate_designations(
 # --- Saving the results ------------------------------------------------------------------------
 
 
-def ensure_metadata_columns(connection: Connection) -> None:
-    """Add any metadata column resource_transcripts lacks.
+def ensure_metadata_table(connection: Connection) -> None:
+    """Create public.resource_metadata if needed, and add any metadata column it lacks.
 
-    The table is created once by src/utils/load_transcripts_to_postgres.py, so a field added to
-    ResourceMetadata later is missing from existing databases. Run before calling the model, so a
-    missing column cannot waste a billed run.
+    A field added to ResourceMetadata later shows up as a new column without dropping the table.
+    Run before choosing resources and before calling the model, so a missing table or column
+    cannot waste a billed run.
+
+    When the table is first created, any metadata an older version of this script stored in the
+    columns of resource_transcripts is copied into it, so those resources are not extracted again.
     """
+    table = sql.Identifier(METADATA_TABLE)
     with connection, connection.cursor() as cursor:
+        cursor.execute("SELECT to_regclass(%s)", (f"public.{METADATA_TABLE}",))
+        is_new = cursor.fetchone()[0] is None
+        cursor.execute(
+            sql.SQL(
+                "CREATE TABLE IF NOT EXISTS public.{} ("
+                "resource_id TEXT PRIMARY KEY, extracted_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+            ).format(table)
+        )
         for column in METADATA_COLUMNS:
             column_type = "TEXT" if column in TEXT_COLUMNS else "JSONB"
             cursor.execute(
-                sql.SQL("ALTER TABLE public.resource_transcripts ADD COLUMN IF NOT EXISTS {} {}").format(
-                    sql.Identifier(column), sql.SQL(column_type)
+                sql.SQL("ALTER TABLE public.{} ADD COLUMN IF NOT EXISTS {} {}").format(
+                    table, sql.Identifier(column), sql.SQL(column_type)
                 )
             )
+        if is_new:
+            copy_old_metadata(cursor)
+
+
+def copy_old_metadata(cursor) -> None:
+    """Copy the metadata stored in resource_transcripts (by older versions) into resource_metadata."""
+    cursor.execute(
+        "SELECT column_name FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND table_name = 'resource_transcripts'"
+    )
+    old_columns = [column for column in METADATA_COLUMNS if column in {row[0] for row in cursor.fetchall()}]
+    if "course_summary" not in old_columns:
+        return
+    names = sql.SQL(", ").join(sql.Identifier(column) for column in ["resource_id", *old_columns])
+    cursor.execute(
+        sql.SQL(
+            "INSERT INTO public.{table} ({names}) SELECT {names} FROM public.resource_transcripts "
+            "WHERE course_summary IS NOT NULL ON CONFLICT (resource_id) DO NOTHING"
+        ).format(table=sql.Identifier(METADATA_TABLE), names=names)
+    )
+    logger.info("Copied the metadata of %d resources from resource_transcripts.", cursor.rowcount)
 
 
 def save_metadata(connection: Connection, resource_id: str, metadata: ResourceMetadata) -> None:
-    """Store each metadata field in its own column of the resource's row."""
+    """Insert the resource's row into resource_metadata, or replace it if it was extracted before."""
     values = metadata.model_dump(mode="json")
-    assignments = sql.SQL(", ").join(
-        sql.SQL("{} = %s").format(sql.Identifier(column)) for column in METADATA_COLUMNS
-    )
+    columns = ["resource_id", *METADATA_COLUMNS]
+    names = [sql.Identifier(column) for column in columns]
     query = sql.SQL(
-        "UPDATE public.resource_transcripts SET {} WHERE resource_id = %s"
-    ).format(assignments)
+        "INSERT INTO public.{table} ({columns}) VALUES ({placeholders}) "
+        "ON CONFLICT (resource_id) DO UPDATE SET {assignments}, extracted_at = now()"
+    ).format(
+        table=sql.Identifier(METADATA_TABLE),
+        columns=sql.SQL(", ").join(names),
+        placeholders=sql.SQL(", ").join(sql.Placeholder() * len(columns)),
+        assignments=sql.SQL(", ").join(sql.SQL("{0} = EXCLUDED.{0}").format(name) for name in names[1:]),
+    )
     parameters = [
         values[column] if column in TEXT_COLUMNS else Json(values[column]) for column in METADATA_COLUMNS
     ]
 
     with connection, connection.cursor() as cursor:
-        cursor.execute(query, [*parameters, resource_id])
-        if cursor.rowcount != 1:
-            raise ResourceSkippedError("resource not found when saving")
+        cursor.execute(query, [resource_id, *parameters])
 
 
 def save_metadata_file(resource_id: str, metadata: ResourceMetadata) -> None:
@@ -261,13 +322,14 @@ async def extract_resource_metadata(requested_ids: list[str] | None = None) -> N
     """Extract and store metadata. With no ids, process every resource without metadata."""
     connection = psycopg2.connect(load_db_dsn())
     try:
+        # First: find_pending_resource_ids reads the table this creates.
+        ensure_metadata_table(connection)
         resource_ids = requested_ids or find_pending_resource_ids(connection)
         total = len(resource_ids)
         if total == 0:
             logger.info("No resources to process.")
             return
         logger.info("Processing %d resources", total)
-        ensure_metadata_columns(connection)
 
         # Built after the resources are known: this creates the (billed) prompt cache.
         settings = load_llm_settings()

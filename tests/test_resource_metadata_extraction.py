@@ -148,7 +148,7 @@ def test_extract_resource_metadata_runs_in_batches(stubbed_io, monkeypatch):
 
     connection = FakeConnection()
     monkeypatch.setattr(extraction, "BATCH_SIZE", 2)
-    monkeypatch.setattr(extraction, "ensure_metadata_columns", lambda connection: None)
+    monkeypatch.setattr(extraction, "ensure_metadata_table", lambda connection: None)
     monkeypatch.setattr(extraction.psycopg2, "connect", lambda dsn: connection)
     monkeypatch.setattr(extraction, "load_db_dsn", lambda: "dsn")
     monkeypatch.setattr(extraction, "load_llm_settings", lambda: type("S", (), {"max_concurrency": 1})())
@@ -169,6 +169,7 @@ def test_extract_resource_metadata_does_nothing_when_no_resources_are_pending(mo
 
     monkeypatch.setattr(extraction.psycopg2, "connect", lambda dsn: FakeConnection())
     monkeypatch.setattr(extraction, "load_db_dsn", lambda: "dsn")
+    monkeypatch.setattr(extraction, "ensure_metadata_table", lambda connection: None)
     monkeypatch.setattr(extraction, "find_pending_resource_ids", lambda connection: [])
     monkeypatch.setattr(extraction, "build_system_prompt", lambda: pytest.fail("cache must not be built"))
 
