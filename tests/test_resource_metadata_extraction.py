@@ -149,6 +149,7 @@ def test_extract_resource_metadata_runs_in_batches(stubbed_io, monkeypatch):
     connection = FakeConnection()
     monkeypatch.setattr(extraction, "BATCH_SIZE", 2)
     monkeypatch.setattr(extraction, "ensure_metadata_table", lambda connection: None)
+    monkeypatch.setattr(extraction, "leave_out_done", lambda connection, ids: ids)
     monkeypatch.setattr(extraction.psycopg2, "connect", lambda dsn: connection)
     monkeypatch.setattr(extraction, "load_db_dsn", lambda: "dsn")
     monkeypatch.setattr(extraction, "load_llm_settings", lambda: type("S", (), {"max_concurrency": 1})())
@@ -207,3 +208,59 @@ def test_prompt_example_keys_follow_schema_order():
     example = json.loads(PROMPT_EXAMPLE)
     assert list(example) == list(ResourceMetadata.model_fields)
     assert list(example["sto_level"]) == ["evidence", "rationale", "value", "confidence"]
+
+
+class DoneConnection:
+    """A connection whose query says these resource ids already have metadata."""
+
+    def __init__(self, done):
+        self.done = done
+        self.params = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def cursor(self):
+        return self
+
+    def execute(self, query, params):
+        self.params = params
+
+    def fetchall(self):
+        return [(rid,) for rid in self.done]
+
+
+def test_leave_out_done_keeps_the_order_of_the_rest():
+    connection = DoneConnection(["do_2", "do_4"])
+    remaining = extraction.leave_out_done(connection, ["do_1", "do_2", "do_3", "do_4", "do_5"])
+    assert remaining == ["do_1", "do_3", "do_5"]
+    assert connection.params == (["do_1", "do_2", "do_3", "do_4", "do_5"],)
+
+
+def test_leave_out_done_with_nothing_done_returns_everything():
+    assert extraction.leave_out_done(DoneConnection([]), ["do_1", "do_2"]) == ["do_1", "do_2"]
+
+
+@pytest.mark.parametrize("skip_done, expected", [(True, ["do_1", "do_3"]), (False, ["do_1", "do_2", "do_3"])])
+def test_extract_skips_done_resources_unless_told_not_to(stubbed_io, monkeypatch, skip_done, expected):
+    class FakeConnection:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(extraction.psycopg2, "connect", lambda dsn: FakeConnection())
+    monkeypatch.setattr(extraction, "load_db_dsn", lambda: "dsn")
+    monkeypatch.setattr(extraction, "ensure_metadata_table", lambda connection: None)
+    monkeypatch.setattr(
+        extraction, "leave_out_done", lambda connection, ids: [i for i in ids if i != "do_2"]
+    )
+    monkeypatch.setattr(extraction, "load_llm_settings", lambda: type("S", (), {"max_concurrency": 1})())
+    monkeypatch.setattr(extraction, "build_system_prompt", lambda: "system")
+    monkeypatch.setattr(extraction, "GeminiProvider", lambda settings, system_prompt: None)
+    monkeypatch.setattr(extraction, "LLMClient", lambda provider, max_concurrency: FakeLLM())
+
+    asyncio.run(extraction.extract_resource_metadata(["do_1", "do_2", "do_3"], skip_done=skip_done))
+
+    assert stubbed_io == expected

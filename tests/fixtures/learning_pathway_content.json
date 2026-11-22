@@ -1,0 +1,89 @@
+{
+ "identifier": "do_11447541113226035216",
+ "courseCategory": "Learning Pathway",
+ "milestones_v1": [
+  {
+   "name": "Milestone 1",
+   "courses": [
+    {
+     "identifier": "do_114473116981411840113",
+     "name": "Learning Pathway Course one - Testing 26th December",
+     "mimeType": "application/vnd.ekstep.content-collection",
+     "primaryCategory": "Course",
+     "status": "Live",
+     "children": [
+      {
+       "identifier": "do_114473124676968448114",
+       "name": "youtube one",
+       "mimeType": "text/x-url",
+       "index": 1,
+       "depth": 1,
+       "parent": "do_114473116981411840113",
+       "primaryCategory": "Learning Resource",
+       "status": "Live"
+      },
+      {
+       "identifier": "do_114473125568528384115",
+       "name": "Youtube two",
+       "mimeType": "text/x-url",
+       "index": 2,
+       "depth": 1,
+       "parent": "do_114473116981411840113",
+       "primaryCategory": "Learning Resource",
+       "status": "Live"
+      },
+      {
+       "identifier": "do_1144731276433653761102",
+       "name": "Final Assessment",
+       "mimeType": "application/vnd.sunbird.questionset",
+       "index": 3,
+       "depth": 1,
+       "parent": "do_114473116981411840113",
+       "primaryCategory": "Course Assessment",
+       "status": "Review"
+      }
+     ]
+    },
+    {
+     "identifier": "do_114473130660085760117",
+     "name": "Learning Pathway Course two - Testing 26th December",
+     "mimeType": "application/vnd.ekstep.content-collection",
+     "primaryCategory": "Course",
+     "status": "Live",
+     "children": [
+      {
+       "identifier": "do_114473131090190336118",
+       "name": "Youtube Resource One ",
+       "mimeType": "text/x-url",
+       "index": 1,
+       "depth": 1,
+       "parent": "do_114473130660085760117",
+       "primaryCategory": "Learning Resource",
+       "status": "Live"
+      },
+      {
+       "identifier": "do_114473131468234752119",
+       "name": "Youtube Resource Two",
+       "mimeType": "text/x-url",
+       "index": 2,
+       "depth": 1,
+       "parent": "do_114473130660085760117",
+       "primaryCategory": "Learning Resource",
+       "status": "Live"
+      },
+      {
+       "identifier": "do_1144731316733542401107",
+       "name": "Final Assessment",
+       "mimeType": "application/vnd.sunbird.questionset",
+       "index": 3,
+       "depth": 1,
+       "parent": "do_114473130660085760117",
+       "primaryCategory": "Course Assessment",
+       "status": "Review"
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

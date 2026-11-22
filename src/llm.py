@@ -11,6 +11,7 @@ To use another vendor, write a class with the two methods of `LLMProvider`.
 
 import asyncio
 import logging
+import threading
 from typing import Protocol, Sequence, TypeVar
 
 from google import genai
@@ -33,7 +34,11 @@ class LLMProvider(Protocol):
 
 
 class GeminiProvider:
-    """Gemini on Vertex AI. The system prompt is cached once and reused by every call."""
+    """Gemini on Vertex AI. The system prompt is cached and reused by every call.
+
+    The cache lives `cache_ttl_seconds`. A call that finds it expired makes a new cache and is
+    tried again once, so a run longer than the TTL keeps working.
+    """
 
     def __init__(self, settings: LLMSettings, system_prompt: str):
         self.settings = settings
@@ -47,25 +52,64 @@ class GeminiProvider:
                 retry_options=types.HttpRetryOptions(attempts=settings.max_attempts),
             ),
         )
+        self._renew_lock = threading.Lock()
         self.cache_name = self._create_cache()
 
     def generate(self, user_message: str, json_schema: dict) -> str:
+        cache_name = self.cache_name
+        try:
+            return self._generate_once(user_message, json_schema, cache_name)
+        except errors.ClientError as error:
+            if not self._is_cache_expired(error):
+                raise
+            self._renew_cache(cache_name)
+            return self._generate_once(user_message, json_schema, self.cache_name)
+
+    async def agenerate(self, user_message: str, json_schema: dict) -> str:
+        cache_name = self.cache_name
+        try:
+            return await self._agenerate_once(user_message, json_schema, cache_name)
+        except errors.ClientError as error:
+            if not self._is_cache_expired(error):
+                raise
+            self._renew_cache(cache_name)
+            return await self._agenerate_once(user_message, json_schema, self.cache_name)
+
+    def _generate_once(self, user_message: str, json_schema: dict, cache_name: str | None) -> str:
         response = self.client.models.generate_content(
             model=self.settings.model,
             contents=user_message,
-            config=self._build_config(json_schema),
+            config=self._build_config(json_schema, cache_name),
         )
         self._log_usage(response)
         return response.text
 
-    async def agenerate(self, user_message: str, json_schema: dict) -> str:
+    async def _agenerate_once(
+        self, user_message: str, json_schema: dict, cache_name: str | None
+    ) -> str:
         response = await self.client.aio.models.generate_content(
             model=self.settings.model,
             contents=user_message,
-            config=self._build_config(json_schema),
+            config=self._build_config(json_schema, cache_name),
         )
         self._log_usage(response)
         return response.text
+
+    @staticmethod
+    def _is_cache_expired(error: errors.ClientError) -> bool:
+        return error.code == 400 and "expired" in (error.message or "").lower()
+
+    def _renew_cache(self, expired_name: str | None) -> None:
+        """Make a new cache, unless another call already replaced `expired_name`.
+
+        Many calls run at once and all fail together when the cache expires; only the first
+        makes the new cache, the others reuse it.
+        """
+        with self._renew_lock:
+            if self.cache_name != expired_name:
+                return
+            logger.warning("Cache %s expired. Creating a new one.", expired_name)
+            self.cache_name = self._create_cache()
 
     def _create_cache(self) -> str | None:
         """Cache the system prompt. Returns None if the prompt is too small to cache."""
@@ -84,12 +128,12 @@ class GeminiProvider:
             return None
         return cache.name
 
-    def _build_config(self, json_schema: dict) -> types.GenerateContentConfig:
+    def _build_config(self, json_schema: dict, cache_name: str | None) -> types.GenerateContentConfig:
         # A cached system prompt must not be sent again in the request.
-        system_instruction = None if self.cache_name else self.system_prompt
+        system_instruction = None if cache_name else self.system_prompt
         return types.GenerateContentConfig(
             system_instruction=system_instruction,
-            cached_content=self.cache_name,
+            cached_content=cache_name,
             temperature=self.settings.temperature,
             max_output_tokens=self.settings.max_output_tokens,
             response_mime_type="application/json",

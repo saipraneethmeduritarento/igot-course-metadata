@@ -16,7 +16,7 @@ import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import Json
 
-from src.config import RESOURCE_METADATA_OUTPUT_DIR, load_db_dsn, load_llm_settings
+from src.config import RESOURCE_METADATA_OUTPUT_DIR, load_db_dsn, load_llm_settings, load_sample_ids
 from src.llm import GeminiProvider, LLMClient
 from src.prompts import RESOURCE_METADATA_SYSTEM_PROMPT, RESOURCE_METADATA_USER_PROMPT
 from src.reference_data import load_designation_names, load_designations, load_kcm_catalogue, load_sgos_tree
@@ -26,44 +26,8 @@ logger = logging.getLogger(__name__)
 
 Connection = psycopg2.extensions.connection
 
-# Resources to process. Leave empty to process every resource without metadata yet.
-RESOURCE_IDS = [
-    "do_1140017973346959361190",
-    "do_1140018028274892801194",
-    "do_1140018061473218561191",
-    "do_1140018088174878721201",
-    "do_1140018138236928001220",
-    "do_114591950667096064188",
-    "do_1145893775421603841220",
-    "do_11458939814686720011041",
-    "do_11459194269945036811265",
-    "do_11459194483711180811125",
-    "do_1145870344041758721132",
-    "do_1145870360173035521986",
-    "do_11458703232655360011037",
-    "do_11458703370266214411094",
-    "do_11458703705615564811079",
-    "do_1137567857355489281291",
-    "do_1137567851239751681435",
-    "do_1137567832409784321299",
-    "do_1137567823583232001433",
-    "do_113756779784151040187",
-    "do_1137567793080729601289",
-    "do_113756778891182080185",
-    "do_1137567747670343681287",
-    "do_1137129168580444161100",
-    "do_113712913889419264199",
-    "do_1137129030786007041113",
-    "do_113712901135106048197",
-    "do_1137128938371973121110",
-    "do_113712870807076864195",
-    "do_11371286260652441617",
-    "do_1137128602693468161107",
-    "do_11371285559701504016",
-    "do_11371285322841292814",
-    "do_113712850390204416190"
-]
-
+# Resources to process, from SAMPLE_IDS_PATH. An empty list processes every resource without metadata yet.
+RESOURCE_IDS = load_sample_ids("resource_id")
 BATCH_SIZE = 20  # resources sent to the model together; results are saved after each batch
 
 # Where the metadata is stored: one row per resource, keyed by resource_id.
@@ -104,6 +68,23 @@ def find_pending_resource_ids(connection: Connection) -> list[str]:
     if len(pending) < len(rows):
         logger.info("Left out %d resources with no transcript.", len(rows) - len(pending))
     return pending
+
+
+def leave_out_done(connection: Connection, resource_ids: list[str]) -> list[str]:
+    """`resource_ids` without the resources that already have metadata (order kept).
+
+    A rerun with the same list then only does what is left, instead of paying for every
+    resource again.
+    """
+    query = sql.SQL("SELECT resource_id FROM public.{table} WHERE resource_id = ANY(%s)").format(
+        table=sql.Identifier(METADATA_TABLE)
+    )
+    with connection, connection.cursor() as cursor:
+        cursor.execute(query, (resource_ids,))
+        done = {row[0] for row in cursor.fetchall()}
+    if done:
+        logger.info("Skipping %d resources that already have metadata.", len(done))
+    return [resource_id for resource_id in resource_ids if resource_id not in done]
 
 
 # --- Building the prompts ----------------------------------------------------------------------
@@ -318,13 +299,22 @@ async def process_batch(connection: Connection, llm: LLMClient, resource_ids: li
     return saved
 
 
-async def extract_resource_metadata(requested_ids: list[str] | None = None) -> None:
-    """Extract and store metadata. With no ids, process every resource without metadata."""
+async def extract_resource_metadata(
+    requested_ids: list[str] | None = None, skip_done: bool = True
+) -> None:
+    """Extract and store metadata.
+
+    With ids, process those that have no metadata yet (all of them with skip_done=False, which
+    replaces the stored metadata). With no ids, process every resource without metadata.
+    """
     connection = psycopg2.connect(load_db_dsn())
     try:
         # First: find_pending_resource_ids reads the table this creates.
         ensure_metadata_table(connection)
-        resource_ids = requested_ids or find_pending_resource_ids(connection)
+        if requested_ids:
+            resource_ids = leave_out_done(connection, requested_ids) if skip_done else requested_ids
+        else:
+            resource_ids = find_pending_resource_ids(connection)
         total = len(resource_ids)
         if total == 0:
             logger.info("No resources to process.")

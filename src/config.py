@@ -1,5 +1,6 @@
 """Environment and settings loading."""
 
+import csv
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,22 +12,35 @@ INPUT_DIR = PROJECT_ROOT / "data" / "input"
 OUTPUT_DIR = PROJECT_ROOT / "data" / "output"
 RESOURCE_METADATA_OUTPUT_DIR = OUTPUT_DIR / "resource_metadata_output"
 COURSE_METADATA_OUTPUT_DIR = OUTPUT_DIR / "course_metadata_output"
+# Cached Extended Content Read API responses, one <course_id>.json per course.
+COURSE_API_DIR = INPUT_DIR / "course_api"
 
 KCM_PATH = INPUT_DIR / "KCM_competency.json"
 SGOS_PATH = INPUT_DIR / "sgos_sectors.json"
 DESIGNATIONS_PATH = INPUT_DIR / "igot_designations.txt"
+# Courses and resources to process: one row per (course_id, resource_id).
+SAMPLE_IDS_PATH = INPUT_DIR / "sample_do_ids_list_for_generation.csv"
+
+
+def load_sample_ids(column: str) -> list[str]:
+    """The distinct, non-empty values of `column` in SAMPLE_IDS_PATH, in file order."""
+    with SAMPLE_IDS_PATH.open(newline="", encoding="utf-8-sig") as file:
+        values = (row[column].strip() for row in csv.DictReader(file))
+        return list(dict.fromkeys(value for value in values if value))
 
 load_dotenv(PROJECT_ROOT / ".env")
 
 # Course roll-up thresholds. An item reaches the course only if its share of the course duration
 # (sum of resource duration x confidence, divided by the course duration) is at least this much.
 COURSE_MIN_SHARE = 0.20
+# Learning mode: the course time is split into an online part and an in-person part (a Hybrid resource counts
+# half for each). A part below this share does not count: Online if the in-person part is below it, Offline if
+# the online part is below it, otherwise Hybrid.
+COURSE_LEARNING_MODE_MIN_SHARE = 0.35
 COURSE_RATIONALE_SOURCES = 2  # resources whose own rationale is quoted in a course-level rationale
 COURSE_EXCLUSION_MIN_SHARE = 0.60  # exclusions are stricter: a role is excluded only on strong support
+# Competencies are not here: a course has ONE competency, from its primary area.
 COURSE_MAX_ITEMS = {
-    "behavioural_competencies": 5,
-    "functional_competencies": 5,
-    "domain_competencies": 3,
     "bloom_taxonomy": 4,
     "target_employee_groups": 4,
     "target_roles": 10,
@@ -63,6 +77,28 @@ def load_llm_settings(model_env_var: str = "GEMINI_PRO_MODEL_NAME") -> LLMSettin
         timeout_seconds=int(os.environ["LLM_TIMEOUT_SECONDS_META"]),
         max_attempts=int(os.environ["MAX_ATTEMPTS"]),
         max_concurrency=int(os.environ["MAX_CONCURRENCY"]),
+    )
+
+
+@dataclass(frozen=True)
+class ApiSettings:
+    """Where and how to call the Karmayogi content API."""
+
+    base_url: str
+    authorization: str  # the full Authorization header value, "Bearer <token>"
+    timeout_seconds: int
+
+
+def load_api_settings() -> ApiSettings:
+    """Read the content API settings from environment variables (.env)."""
+    key = os.environ["KARMAYOGI_API_KEY"].strip()
+    # .env.example stores the key with its "Bearer " prefix; accept it with or without.
+    if not key.lower().startswith("bearer "):
+        key = f"Bearer {key}"
+    return ApiSettings(
+        base_url=os.environ["KARMAYOGI_BASE_URL"].rstrip("/"),
+        authorization=key,
+        timeout_seconds=int(os.environ.get("API_REQUEST_TIMEOUT", "30")),
     )
 
 
