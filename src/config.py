@@ -19,7 +19,8 @@ KCM_PATH = INPUT_DIR / "KCM_competency.json"
 SGOS_PATH = INPUT_DIR / "sgos_sectors.json"
 DESIGNATIONS_PATH = INPUT_DIR / "igot_designations.txt"
 # Courses and resources to process: one row per (course_id, resource_id).
-SAMPLE_IDS_PATH = INPUT_DIR / "sample_do_ids_list_for_generation.csv"
+# SAMPLE_IDS_PATH = INPUT_DIR / "sample_do_ids_list_for_generation.csv"
+SAMPLE_IDS_PATH = INPUT_DIR / "common_courses_with_resources_24-11-2026.csv"
 
 
 def load_sample_ids(column: str) -> list[str]:
@@ -39,13 +40,26 @@ COURSE_MIN_SHARE = 0.20
 COURSE_LEARNING_MODE_MIN_SHARE = 0.35
 COURSE_RATIONALE_SOURCES = 2  # resources whose own rationale is quoted in a course-level rationale
 COURSE_EXCLUSION_MIN_SHARE = 0.60  # exclusions are stricter: a role is excluded only on strong support
-# Competencies are not here: a course has ONE competency, from its primary area.
 COURSE_MAX_ITEMS = {
     "bloom_taxonomy": 4,
     "target_employee_groups": 4,
     "target_roles": 10,
     "target_roles_exclusions": 5,
+    # A course has competencies from ONE area (its primary area): up to this many theme/sub-theme
+    # pairs (Behavioural, Functional) or sector/subsector/theme paths (Domain). The strongest one
+    # is always kept; the others need COURSE_MIN_SHARE.
+    "behavioural_competencies": 5,
+    "functional_competencies": 5,
+    "domain_competencies": 5,
 }
+
+# Which prompt module each pipeline uses: "v1" (src/prompts.py) or "v2" (src/prompts_v2.py).
+# Resource extraction: stored in resource_metadata_v2.prompt_version, next to `model_used`.
+RESOURCE_PROMPT_VERSION = "v2"
+# Course roll-up: stored in course_metadata_rollup_v2.prompt_version. The roll-up reads the
+# resource rows of RESOURCE_PROMPT_VERSION and of the same model, and stores that version in
+# course_metadata_rollup_v2.resource_prompt_version.
+COURSE_PROMPT_VERSION = "v2"
 
 
 @dataclass(frozen=True)

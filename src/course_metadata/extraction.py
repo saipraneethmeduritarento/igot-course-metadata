@@ -2,21 +2,26 @@
 
 For each course:
   1. Read its resources from public.resource_transcripts, with their metadata from
-     public.resource_metadata. A course is rolled up only when every
-     resource that has a transcript already has metadata; otherwise it is skipped.
+     public.resource_metadata_v2: only the rows of the same model and of RESOURCE_PROMPT_VERSION.
+     A course is rolled up only when every resource that has a transcript already has such a
+     row; otherwise it is skipped.
   2. Decide in code every field that depends on duration. A value's "share" is the sum of
      (resource duration x confidence) over the resources that give it, divided by the course
      duration.
      - Single-value fields take the value with the highest share.
      - List fields keep the items whose share reaches the thresholds in src/config.py.
-     - The course has ONE competency: the one with the highest share in the primary area. The
-       primary area is always one that has a complete competency, so it is never missing.
+     - Competencies come from ONE area, the primary area: the one with the highest share is
+       always kept, then up to COURSE_MAX_ITEMS in total whose share reaches COURSE_MIN_SHARE.
+       The primary area is always one that has a complete competency, so it is never missing.
      - Presenters and reference resources are merged across resources, never rewritten.
   3. Ask the model only for the text fields (CourseTextMetadata), from the resources' own text
-     fields. The decisions of step 2 are not sent, so they cannot bias the text.
+     fields. The decisions of step 2 are not sent, so they cannot bias the text. The prompt
+     module is chosen by COURSE_PROMPT_VERSION in src/config.py.
   4. Build `keywords_list` from the model's keywords.
-  5. Store one row in public.course_metadata_rollup and write the same row to
-     <COURSE_METADATA_OUTPUT_DIR>/<course_id>.json.
+  5. Store one row in public.course_metadata_rollup_v2, keyed by (course_id, model_used,
+     prompt_version, resource_prompt_version), so a run with another model or prompt version
+     adds rows next to the old ones. Write the same row to
+     <COURSE_METADATA_OUTPUT_DIR>/<model>_course-<version>_resource-<version>/<course_id>.json.
 
 Run src.resource_metadata.extraction first. Then, from the project root:
     python -m src.course_metadata.extraction
@@ -28,6 +33,7 @@ import logging
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, NamedTuple
 
 import psycopg2
@@ -42,7 +48,9 @@ from src.config import (
     COURSE_MAX_ITEMS,
     COURSE_METADATA_OUTPUT_DIR,
     COURSE_MIN_SHARE,
+    COURSE_PROMPT_VERSION,
     COURSE_RATIONALE_SOURCES,
+    RESOURCE_PROMPT_VERSION,
     load_db_dsn,
     load_llm_settings,
 )
@@ -58,7 +66,7 @@ from src.course_metadata.schema import (
     CourseTextMetadata,
 )
 from src.llm import GeminiProvider, LLMClient
-from src.prompts import COURSE_METADATA_SYSTEM_PROMPT, COURSE_METADATA_USER_PROMPT
+from src.prompt_versions import prompts_for
 from src.resource_metadata.extraction import METADATA_COLUMNS as RESOURCE_COLUMNS
 from src.resource_metadata.extraction import METADATA_TABLE as RESOURCE_METADATA_TABLE
 from src.resource_metadata.extraction import TEXT_COLUMNS
@@ -86,6 +94,16 @@ Entries = list[tuple[float, dict[str, Any]]]
 COURSE_IDS: list[str] = load_sample_ids("course_id")
 
 BATCH_SIZE = 5  # courses sent to the model together; results are saved after each batch
+
+COURSE_PROMPTS = prompts_for(COURSE_PROMPT_VERSION)
+
+ROLLUP_TABLE = "course_metadata_rollup_v2"
+# What produced a row: the model (of both the resource rows and the roll-up), the course prompt
+# version and the prompt version of the resource rows it was rolled up from. Together with
+# course_id, the primary key.
+RUN_COLUMNS = ["model_used", "prompt_version", "resource_prompt_version"]
+# `model_used`, `prompt_version` and `resource_prompt_version` of a run.
+RunInfo = dict[str, str]
 
 # --- Fields and columns -----------------------------------------------------------------------
 
@@ -125,17 +143,30 @@ HAS_TRANSCRIPT_SQL = sql.SQL(
     "(COALESCE(TRIM(t.video_transcript), '') <> '' OR COALESCE(TRIM(t.audio_transcript), '') <> '')"
 )
 
+# The metadata row of each resource from one model and resource prompt version (two parameters,
+# see resource_metadata_join_parameters). In the ON clause, so a resource without such a row
+# still appears, with NULL metadata, and its course is reported as incomplete.
+RESOURCE_METADATA_JOIN_SQL = sql.SQL(
+    "LEFT JOIN public.{metadata_table} m ON m.resource_id = t.resource_id "
+    "AND m.model_used = %s AND m.prompt_version = %s"
+).format(metadata_table=sql.Identifier(RESOURCE_METADATA_TABLE))
+
 CREATE_TABLE_SQL = sql.SQL(
     """
-    CREATE TABLE IF NOT EXISTS public.course_metadata_rollup (
-        course_id         TEXT PRIMARY KEY,
-        resource_ids      JSONB NOT NULL,
-        language          TEXT,
-        list_of_languages JSONB NOT NULL,
-        {metadata_columns}
+    CREATE TABLE IF NOT EXISTS public.{table} (
+        course_id               TEXT NOT NULL,
+        model_used              TEXT NOT NULL,
+        prompt_version          TEXT NOT NULL,
+        resource_prompt_version TEXT NOT NULL,
+        resource_ids            JSONB NOT NULL,
+        language                TEXT,
+        list_of_languages       JSONB NOT NULL,
+        {metadata_columns},
+        PRIMARY KEY (course_id, model_used, prompt_version, resource_prompt_version)
     )
     """
 ).format(
+    table=sql.Identifier(ROLLUP_TABLE),
     metadata_columns=sql.SQL(",\n        ").join(
         sql.SQL("{} {}").format(
             sql.Identifier(column), sql.SQL("JSONB" if column in JSONB_COLUMNS else "TEXT")
@@ -174,52 +205,66 @@ class RankedGroup(NamedTuple):
 
 
 def create_rollup_table(connection: Connection) -> None:
-    """Create public.course_metadata_rollup if it does not exist."""
+    """Create public.course_metadata_rollup_v2 if it does not exist."""
     with connection, connection.cursor() as cursor:
         cursor.execute(CREATE_TABLE_SQL)
 
 
-def find_pending_course_ids(connection: Connection) -> list[str]:
-    """Courses with no roll-up yet whose resources (those with a transcript) all have metadata."""
+def resource_metadata_join_parameters(run_info: RunInfo) -> tuple[str, str]:
+    """The parameters of RESOURCE_METADATA_JOIN_SQL: the resource rows of this model and of the
+    resource prompt version."""
+    return run_info["model_used"], run_info["resource_prompt_version"]
+
+
+def find_pending_course_ids(connection: Connection, run_info: RunInfo) -> list[str]:
+    """Courses with no roll-up yet from this run (`run_info`) whose resources (those with a
+    transcript) all have metadata from this model and resource prompt version."""
     query = sql.SQL(
-        "SELECT t.course_id FROM public.resource_transcripts t "
-        "LEFT JOIN public.{metadata_table} m ON m.resource_id = t.resource_id "
+        "SELECT t.course_id FROM public.resource_transcripts t {join_metadata} "
         "WHERE t.course_id IS NOT NULL AND {has_transcript} "
-        "AND t.course_id NOT IN (SELECT course_id FROM public.course_metadata_rollup) "
+        "AND t.course_id NOT IN (SELECT course_id FROM public.{rollup_table} "
+        "WHERE model_used = %s AND prompt_version = %s AND resource_prompt_version = %s) "
         "GROUP BY t.course_id HAVING bool_and(m.course_summary IS NOT NULL) ORDER BY t.course_id"
     ).format(
-        metadata_table=sql.Identifier(RESOURCE_METADATA_TABLE),
+        join_metadata=RESOURCE_METADATA_JOIN_SQL,
+        rollup_table=sql.Identifier(ROLLUP_TABLE),
         has_transcript=HAS_TRANSCRIPT_SQL,
     )
+    parameters = (
+        *resource_metadata_join_parameters(run_info),
+        *(run_info[column] for column in RUN_COLUMNS),
+    )
     with connection, connection.cursor() as cursor:
-        cursor.execute(query)
+        cursor.execute(query, parameters)
         return [row[0] for row in cursor.fetchall()]
 
 
-def fetch_course_resources(connection: Connection, course_id: str) -> list[Resource]:
-    """The resources of the course that have a transcript, each with its metadata.
+def fetch_course_resources(
+    connection: Connection, course_id: str, run_info: RunInfo
+) -> list[Resource]:
+    """The resources of the course that have a transcript, each with its metadata from this
+    model and resource prompt version.
 
-    Raises CourseSkippedError if there are none, or if any of them has no metadata yet (the
+    Raises CourseSkippedError if there are none, or if any of them has no such metadata yet (the
     message lists the missing resource ids).
     """
     # Ids, duration and languages come from resource_transcripts; the metadata from
-    # resource_metadata. A resource without metadata yet gets NULLs (LEFT JOIN).
+    # resource_metadata_v2. A resource without metadata yet gets NULLs (LEFT JOIN).
     transcript_columns = ["resource_id", "duration_in_sec", "source_language", "source_languages"]
     columns = [*transcript_columns, *RESOURCE_COLUMNS]
     query = sql.SQL(
-        "SELECT {columns} FROM public.resource_transcripts t "
-        "LEFT JOIN public.{metadata_table} m ON m.resource_id = t.resource_id "
+        "SELECT {columns} FROM public.resource_transcripts t {join_metadata} "
         "WHERE t.course_id = %s AND {has_transcript} ORDER BY t.resource_id"
     ).format(
         columns=sql.SQL(", ").join(
             [sql.Identifier("t", column) for column in transcript_columns]
             + [sql.Identifier("m", column) for column in RESOURCE_COLUMNS]
         ),
-        metadata_table=sql.Identifier(RESOURCE_METADATA_TABLE),
+        join_metadata=RESOURCE_METADATA_JOIN_SQL,
         has_transcript=HAS_TRANSCRIPT_SQL,
     )
     with connection, connection.cursor() as cursor:
-        cursor.execute(query, (course_id,))
+        cursor.execute(query, (*resource_metadata_join_parameters(run_info), course_id))
         resources = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
 
     if not resources:
@@ -688,21 +733,30 @@ def roll_up_primary_area(resources: list[Resource]) -> dict[str, Any]:
 
 
 def roll_up_competencies(resources: list[Resource], area: str) -> dict[str, Any]:
-    """ONE competency, in the field of the course's primary area; the other two fields are None.
+    """The competencies of the course's primary area, in its field; the other two fields are [].
 
-    The competency is the complete one (see complete_competencies) with the highest share, with no
-    minimum share; roll_up_primary_area guarantees that one exists. A KCM competency (Behavioural
-    or Functional) also gets its `proficiency_level` by weighted vote; a Domain one has none.
+    Only complete competencies count (see complete_competencies). The one with the highest share
+    is always kept, with no minimum share (roll_up_primary_area guarantees that one exists), so the
+    course always has a competency. After it come the others whose share reaches COURSE_MIN_SHARE,
+    highest first, up to COURSE_MAX_ITEMS of the area's field in total. A KCM competency
+    (Behavioural or Functional) also gets its `proficiency_level` by weighted vote; a Domain one
+    has none.
     """
-    strongest = rank_groups(complete_competencies(resources, area), resources)[0]
-    competency = judged_item(strongest, COMPETENCY_KEYS_OF_AREA[area], resources)
-    if area != "Domain":
-        competency["proficiency_level"] = heaviest(
-            (item["proficiency_level"], seconds * item["confidence"])
-            for seconds, item in strongest.entries
-        )
-    competencies = dict.fromkeys(COMPETENCY_FIELD_OF_AREA.values())
-    competencies[COMPETENCY_FIELD_OF_AREA[area]] = competency
+    field_name = COMPETENCY_FIELD_OF_AREA[area]
+    strongest, *others = rank_groups(complete_competencies(resources, area), resources)
+    kept = [strongest, *(group for group in others if group.share >= COURSE_MIN_SHARE)]
+
+    def competency_of(group: RankedGroup) -> dict[str, Any]:
+        competency = judged_item(group, COMPETENCY_KEYS_OF_AREA[area], resources)
+        if area != "Domain":
+            competency["proficiency_level"] = heaviest(
+                (item["proficiency_level"], seconds * item["confidence"])
+                for seconds, item in group.entries
+            )
+        return competency
+
+    competencies: dict[str, Any] = {name: [] for name in COMPETENCY_FIELD_OF_AREA.values()}
+    competencies[field_name] = [competency_of(group) for group in kept[: COURSE_MAX_ITEMS[field_name]]]
     return competencies
 
 
@@ -752,7 +806,7 @@ def build_user_prompt(resources: list[Resource]) -> str:
         for resource in resources
     ]
     resources_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    return COURSE_METADATA_USER_PROMPT.format(resources_json=resources_json)
+    return COURSE_PROMPTS.COURSE_METADATA_USER_PROMPT.format(resources_json=resources_json)
 
 
 def order_like_learner_portal(course_id: str, resources: list[Resource]) -> list[Resource]:
@@ -777,9 +831,9 @@ def order_like_learner_portal(course_id: str, resources: list[Resource]) -> list
     return ordered
 
 
-def prepare_course(connection: Connection, course_id: str) -> PreparedCourse:
+def prepare_course(connection: Connection, course_id: str, run_info: RunInfo) -> PreparedCourse:
     """Read a course and do everything that needs no model."""
-    resources = fetch_course_resources(connection, course_id)
+    resources = fetch_course_resources(connection, course_id, run_info)
     resources = order_like_learner_portal(course_id, resources)
     normalise_durations(resources)
     return PreparedCourse(
@@ -847,53 +901,75 @@ def build_course_metadata(
 # --- Step 5: saving the results ---------------------------------------------------------------
 
 
-def build_rollup_row(resource_info: dict[str, Any], metadata: CourseMetadata) -> dict[str, Any]:
-    """The course_metadata_rollup row as JSON-ready values, keyed by column, in column order."""
+def build_rollup_row(
+    resource_info: dict[str, Any], metadata: CourseMetadata, run_info: RunInfo
+) -> dict[str, Any]:
+    """The course_metadata_rollup_v2 row as JSON-ready values, keyed by column, in column order.
+
+    run_info: the RUN_COLUMNS of this run (model, course and resource prompt versions).
+    """
     return {
         "course_id": metadata.course_id,
+        **{column: run_info[column] for column in RUN_COLUMNS},
         **resource_info,
         **metadata.model_dump(mode="json", exclude={"course_id"}),
     }
 
 
 def save_rollup(connection: Connection, row: dict[str, Any]) -> None:
-    """Insert the course row, or replace it if the course was rolled up before."""
+    """Insert the course row, or replace it if the course was rolled up before with the same
+    model and prompt versions. A row from another model or prompt version is kept."""
+    key_columns = ["course_id", *RUN_COLUMNS]
     columns = list(row)
     parameters = [
         Json(row[column]) if column in JSONB_COLUMNS else row[column] for column in columns
     ]
     query = sql.SQL(
-        "INSERT INTO public.course_metadata_rollup ({columns}) VALUES ({placeholders}) "
-        "ON CONFLICT (course_id) DO UPDATE SET {assignments}"
+        "INSERT INTO public.{table} ({columns}) VALUES ({placeholders}) "
+        "ON CONFLICT ({key_columns}) DO UPDATE SET {assignments}"
     ).format(
+        table=sql.Identifier(ROLLUP_TABLE),
         columns=sql.SQL(", ").join(sql.Identifier(column) for column in columns),
         placeholders=sql.SQL(", ").join(sql.Placeholder() * len(columns)),
+        key_columns=sql.SQL(", ").join(sql.Identifier(column) for column in key_columns),
         assignments=sql.SQL(", ").join(
             sql.SQL("{0} = EXCLUDED.{0}").format(sql.Identifier(column))
             for column in columns
-            if column != "course_id"
+            if column not in key_columns
         ),
     )
     with connection, connection.cursor() as cursor:
         cursor.execute(query, parameters)
 
 
+def rollup_file_path(row: dict[str, Any]) -> Path:
+    """<COURSE_METADATA_OUTPUT_DIR>/<model>_course-<version>_resource-<version>/<course_id>.json,
+    so a run with another model or prompt version never overwrites the files of an earlier one."""
+    run_dir = (
+        f"{row['model_used']}_course-{row['prompt_version']}"
+        f"_resource-{row['resource_prompt_version']}"
+    )
+    return COURSE_METADATA_OUTPUT_DIR / run_dir / f"{row['course_id']}.json"
+
+
 def save_rollup_file(row: dict[str, Any]) -> None:
-    """Write the row to <COURSE_METADATA_OUTPUT_DIR>/<course_id>.json."""
-    COURSE_METADATA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = COURSE_METADATA_OUTPUT_DIR / f"{row['course_id']}.json"
+    """Write the row to its rollup_file_path."""
+    output_path = rollup_file_path(row)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(row, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # --- Running ----------------------------------------------------------------------------------
 
 
-async def process_batch(connection: Connection, llm: LLMClient, course_ids: list[str]) -> int:
+async def process_batch(
+    connection: Connection, llm: LLMClient, course_ids: list[str], run_info: RunInfo
+) -> int:
     """Roll up one batch of courses. Returns how many were saved."""
     courses: dict[str, PreparedCourse] = {}
     for course_id in course_ids:
         try:
-            courses[course_id] = prepare_course(connection, course_id)
+            courses[course_id] = prepare_course(connection, course_id, run_info)
         except CourseSkippedError as error:
             logger.warning("Skipped %s: %s", course_id, error)
         except psycopg2.Error:
@@ -910,7 +986,7 @@ async def process_batch(connection: Connection, llm: LLMClient, course_ids: list
             continue
         try:
             metadata = build_course_metadata(course_id, course.rolled_up, result)
-            row = build_rollup_row(course.resource_info, metadata)
+            row = build_rollup_row(course.resource_info, metadata, run_info)
             # File first: if the database save fails, the billed response is still kept.
             save_rollup_file(row)
             save_rollup(connection, row)
@@ -921,26 +997,39 @@ async def process_batch(connection: Connection, llm: LLMClient, course_ids: list
 
 
 async def rollup_course_metadata(requested_ids: list[str] | None = None) -> None:
-    """Roll up and store course metadata. With no ids, process every course without a roll-up."""
+    """Roll up and store course metadata. With no ids, process every course without a roll-up
+    from this model and these prompt versions."""
+    settings = load_llm_settings()
+    run_info = {
+        "model_used": settings.model,
+        "prompt_version": COURSE_PROMPTS.PROMPT_VERSION,
+        "resource_prompt_version": prompts_for(RESOURCE_PROMPT_VERSION).PROMPT_VERSION,
+    }
     connection = psycopg2.connect(load_db_dsn())
     try:
         create_rollup_table(connection)
-        course_ids = requested_ids or find_pending_course_ids(connection)
+        course_ids = requested_ids or find_pending_course_ids(connection, run_info)
         total = len(course_ids)
         if total == 0:
             logger.info("No courses to process.")
             return
-        logger.info("Processing %d courses", total)
+        logger.info(
+            "Processing %d courses with %s, course prompt %s, resource rows of prompt %s",
+            total,
+            run_info["model_used"],
+            run_info["prompt_version"],
+            run_info["resource_prompt_version"],
+        )
 
-        settings = load_llm_settings()
         llm = LLMClient(
-            GeminiProvider(settings, COURSE_METADATA_SYSTEM_PROMPT), settings.max_concurrency
+            GeminiProvider(settings, COURSE_PROMPTS.COURSE_METADATA_SYSTEM_PROMPT),
+            settings.max_concurrency,
         )
 
         saved = 0
         for start in range(0, total, BATCH_SIZE):
             batch = course_ids[start : start + BATCH_SIZE]
-            saved += await process_batch(connection, llm, batch)
+            saved += await process_batch(connection, llm, batch, run_info)
             logger.info("Progress: %d/%d processed, %d saved", start + len(batch), total, saved)
         logger.info("Done. Saved the roll-up of %d of %d courses.", saved, total)
     finally:

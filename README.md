@@ -17,9 +17,9 @@ Run every step from the project root, in this order:
 | --- | --- | --- | --- |
 | 1 | `python -m src.utils.combine_transcripts` | `data/input/transcripts/*.json` | `data/input/resource_transcripts.json` |
 | 2 | `python -m src.utils.load_transcripts_to_postgres` | `resource_transcripts.json` | table `resource_transcripts` |
-| 3 | `python -m src.resource_metadata.extraction` | `resource_transcripts`, reference masters | table `resource_metadata`, `data/output/resource_metadata_output/<resource_id>.json` |
-| 4 | `python -m src.course_metadata.extraction` | `resource_transcripts`, `resource_metadata`, content API | table `course_metadata_rollup`, `data/output/course_metadata_output/<course_id>.json` |
-| 5 | `python -m src.utils.create_course_metadata_llm [course_id ...]` | `course_metadata_rollup` | table `course_metadata_llm` |
+| 3 | `python -m src.resource_metadata.extraction` | `resource_transcripts`, reference masters | table `resource_metadata_v2` (one row per resource, model and prompt version), `data/output/resource_metadata_output/<model>_<prompt_version>/<resource_id>.json` |
+| 4 | `python -m src.course_metadata.extraction` | `resource_transcripts`, `resource_metadata_v2` (rows of the same model and `RESOURCE_PROMPT_VERSION`), content API | table `course_metadata_rollup_v2` (one row per course, model, course prompt version and resource prompt version), `data/output/course_metadata_output/<model>_course-<version>_resource-<version>/<course_id>.json` |
+| 5 | `python -m src.utils.create_course_metadata_llm [course_id ...]` | `course_metadata_rollup` (the old table; not yet switched to v2) | table `course_metadata_llm` |
 
 Optional: `python -m src.utils.build_transcripts_table` exports `resource_transcripts.json` to a
 CSV you can open in Excel. No other step reads this CSV.

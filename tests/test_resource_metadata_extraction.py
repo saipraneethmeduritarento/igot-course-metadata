@@ -60,13 +60,16 @@ def test_unknown_resource_is_skipped():
         fetch_user_prompt(FakeConnection(None), "do_1")
 
 
-def test_metadata_file_is_named_after_the_resource_id(tmp_path, monkeypatch):
+RUN_INFO = {"model_used": "gemini-test", "prompt_version": "v9"}
+
+
+def test_metadata_file_is_named_after_the_resource_id_in_a_folder_per_run(tmp_path, monkeypatch):
     monkeypatch.setattr("src.resource_metadata.extraction.RESOURCE_METADATA_OUTPUT_DIR", tmp_path / "out")
     metadata = ResourceMetadata.model_validate_json(PROMPT_EXAMPLE)
 
-    save_metadata_file("do_1", metadata)
+    save_metadata_file("do_1", metadata, RUN_INFO)
 
-    saved = ResourceMetadata.model_validate_json((tmp_path / "out" / "do_1.json").read_text())
+    saved = ResourceMetadata.model_validate_json((tmp_path / "out" / "gemini-test_v9" / "do_1.json").read_text())
     assert saved == metadata
 
 
@@ -115,6 +118,10 @@ class FakeLLM:
         return results
 
 
+def fake_settings():
+    return type("S", (), {"max_concurrency": 1, "model": "gemini-test"})()
+
+
 @pytest.fixture
 def stubbed_io(monkeypatch):
     """Replace the database and file writes; record which resources get saved."""
@@ -126,14 +133,14 @@ def stubbed_io(monkeypatch):
         return f"resource_id: {resource_id}"
 
     monkeypatch.setattr(extraction, "fetch_user_prompt", fake_fetch)
-    monkeypatch.setattr(extraction, "save_metadata", lambda conn, rid, metadata: saved.append(rid))
-    monkeypatch.setattr(extraction, "save_metadata_file", lambda rid, metadata: None)
+    monkeypatch.setattr(extraction, "save_metadata", lambda conn, rid, metadata, run_info: saved.append(rid))
+    monkeypatch.setattr(extraction, "save_metadata_file", lambda rid, metadata, run_info: None)
     return saved
 
 
 def test_process_batch_saves_successes_and_survives_skips_and_failures(stubbed_io):
     count = asyncio.run(
-        extraction.process_batch(None, FakeLLM(), ["do_1", "do_missing", "do_bad", "do_2"])
+        extraction.process_batch(None, FakeLLM(), ["do_1", "do_missing", "do_bad", "do_2"], RUN_INFO)
     )
     assert count == 2
     assert stubbed_io == ["do_1", "do_2"]
@@ -149,10 +156,10 @@ def test_extract_resource_metadata_runs_in_batches(stubbed_io, monkeypatch):
     connection = FakeConnection()
     monkeypatch.setattr(extraction, "BATCH_SIZE", 2)
     monkeypatch.setattr(extraction, "ensure_metadata_table", lambda connection: None)
-    monkeypatch.setattr(extraction, "leave_out_done", lambda connection, ids: ids)
+    monkeypatch.setattr(extraction, "leave_out_done", lambda connection, ids, run_info: ids)
     monkeypatch.setattr(extraction.psycopg2, "connect", lambda dsn: connection)
     monkeypatch.setattr(extraction, "load_db_dsn", lambda: "dsn")
-    monkeypatch.setattr(extraction, "load_llm_settings", lambda: type("S", (), {"max_concurrency": 1})())
+    monkeypatch.setattr(extraction, "load_llm_settings", fake_settings)
     monkeypatch.setattr(extraction, "build_system_prompt", lambda: "system")
     monkeypatch.setattr(extraction, "GeminiProvider", lambda settings, system_prompt: None)
     monkeypatch.setattr(extraction, "LLMClient", lambda provider, max_concurrency: FakeLLM())
@@ -171,7 +178,8 @@ def test_extract_resource_metadata_does_nothing_when_no_resources_are_pending(mo
     monkeypatch.setattr(extraction.psycopg2, "connect", lambda dsn: FakeConnection())
     monkeypatch.setattr(extraction, "load_db_dsn", lambda: "dsn")
     monkeypatch.setattr(extraction, "ensure_metadata_table", lambda connection: None)
-    monkeypatch.setattr(extraction, "find_pending_resource_ids", lambda connection: [])
+    monkeypatch.setattr(extraction, "find_pending_resource_ids", lambda connection, run_info: [])
+    monkeypatch.setattr(extraction, "load_llm_settings", fake_settings)
     monkeypatch.setattr(extraction, "build_system_prompt", lambda: pytest.fail("cache must not be built"))
 
     asyncio.run(extraction.extract_resource_metadata(None))
@@ -235,13 +243,13 @@ class DoneConnection:
 
 def test_leave_out_done_keeps_the_order_of_the_rest():
     connection = DoneConnection(["do_2", "do_4"])
-    remaining = extraction.leave_out_done(connection, ["do_1", "do_2", "do_3", "do_4", "do_5"])
+    remaining = extraction.leave_out_done(connection, ["do_1", "do_2", "do_3", "do_4", "do_5"], RUN_INFO)
     assert remaining == ["do_1", "do_3", "do_5"]
-    assert connection.params == (["do_1", "do_2", "do_3", "do_4", "do_5"],)
+    assert connection.params == (["do_1", "do_2", "do_3", "do_4", "do_5"], "gemini-test", "v9")
 
 
 def test_leave_out_done_with_nothing_done_returns_everything():
-    assert extraction.leave_out_done(DoneConnection([]), ["do_1", "do_2"]) == ["do_1", "do_2"]
+    assert extraction.leave_out_done(DoneConnection([]), ["do_1", "do_2"], RUN_INFO) == ["do_1", "do_2"]
 
 
 @pytest.mark.parametrize("skip_done, expected", [(True, ["do_1", "do_3"]), (False, ["do_1", "do_2", "do_3"])])
@@ -254,9 +262,9 @@ def test_extract_skips_done_resources_unless_told_not_to(stubbed_io, monkeypatch
     monkeypatch.setattr(extraction, "load_db_dsn", lambda: "dsn")
     monkeypatch.setattr(extraction, "ensure_metadata_table", lambda connection: None)
     monkeypatch.setattr(
-        extraction, "leave_out_done", lambda connection, ids: [i for i in ids if i != "do_2"]
+        extraction, "leave_out_done", lambda connection, ids, run_info: [i for i in ids if i != "do_2"]
     )
-    monkeypatch.setattr(extraction, "load_llm_settings", lambda: type("S", (), {"max_concurrency": 1})())
+    monkeypatch.setattr(extraction, "load_llm_settings", fake_settings)
     monkeypatch.setattr(extraction, "build_system_prompt", lambda: "system")
     monkeypatch.setattr(extraction, "GeminiProvider", lambda settings, system_prompt: None)
     monkeypatch.setattr(extraction, "LLMClient", lambda provider, max_concurrency: FakeLLM())
@@ -264,3 +272,35 @@ def test_extract_skips_done_resources_unless_told_not_to(stubbed_io, monkeypatch
     asyncio.run(extraction.extract_resource_metadata(["do_1", "do_2", "do_3"], skip_done=skip_done))
 
     assert stubbed_io == expected
+
+
+def test_pending_resources_are_those_without_a_row_from_this_model_and_prompt_version():
+    connection = DoneConnection([])
+    connection.fetchall = lambda: [("do_1", True), ("do_2", False)]
+    assert extraction.find_pending_resource_ids(connection, RUN_INFO) == ["do_1"]
+    assert connection.params == ("gemini-test", "v9")
+
+
+def test_metadata_table_is_v2_and_keyed_by_resource_model_and_prompt_version():
+    text = repr(extraction.CREATE_TABLE_SQL)
+    assert "resource_metadata_v2" in text
+    assert "PRIMARY KEY (resource_id, model_used, prompt_version)" in text
+
+
+def test_run_saves_with_the_model_and_prompt_version(stubbed_io, monkeypatch):
+    runs = []
+    monkeypatch.setattr(
+        extraction, "save_metadata", lambda conn, rid, metadata, run_info: runs.append(run_info)
+    )
+    monkeypatch.setattr(extraction.psycopg2, "connect", lambda dsn: type("C", (), {"close": lambda self: None})())
+    monkeypatch.setattr(extraction, "load_db_dsn", lambda: "dsn")
+    monkeypatch.setattr(extraction, "ensure_metadata_table", lambda connection: None)
+    monkeypatch.setattr(extraction, "leave_out_done", lambda connection, ids, run_info: ids)
+    monkeypatch.setattr(extraction, "load_llm_settings", fake_settings)
+    monkeypatch.setattr(extraction, "build_system_prompt", lambda: "system")
+    monkeypatch.setattr(extraction, "GeminiProvider", lambda settings, system_prompt: None)
+    monkeypatch.setattr(extraction, "LLMClient", lambda provider, max_concurrency: FakeLLM())
+
+    asyncio.run(extraction.extract_resource_metadata(["do_1"]))
+
+    assert runs == [{"model_used": "gemini-test", "prompt_version": extraction.RESOURCE_PROMPTS.PROMPT_VERSION}]

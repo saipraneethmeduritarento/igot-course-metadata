@@ -4,13 +4,17 @@ import re
 import pytest
 from pydantic import ValidationError
 
+from src.config import COURSE_MAX_ITEMS, COURSE_PROMPT_VERSION
 from src.course_metadata.extraction import (
     COURSE_COLUMNS,
+    COURSE_PROMPTS,
+    CREATE_TABLE_SQL,
     RESOURCE_COLUMNS,
     CourseSkippedError,
     TEXT_FIELDS,
     build_course_metadata,
     build_keywords_list,
+    build_rollup_row,
     build_user_prompt,
     collect_languages,
     collect_resource_info,
@@ -18,8 +22,10 @@ from src.course_metadata.extraction import (
     fetch_course_resources,
     normalise_durations,
     roll_up_resources,
+    rollup_file_path,
 )
 from src.course_metadata.schema import CourseMetadata, CourseTextMetadata
+from src.prompt_versions import PROMPT_MODULES, prompts_for
 from src.prompts import COURSE_METADATA_SYSTEM_PROMPT
 from src.resource_metadata.schema import Keyword
 
@@ -258,43 +264,55 @@ def test_learning_mode_rationale_states_both_shares_and_the_rule():
     assert "Online part: Online 0." in rationale and "In-person part" not in rationale
 
 
-def test_only_the_primary_area_has_a_competency():
+def test_only_the_primary_area_has_competencies():
     resources = [
         resource("a", 800, area="Functional", functional_competencies=[kcm("F1")]),
         resource("b", 200, area="Behavioural", behavioural_competencies=[kcm("B1")]),
     ]
     rolled_up = roll_up_resources(resources)
-    assert rolled_up["functional_competencies"]["competency_id"] == "F1"
-    assert rolled_up["behavioural_competencies"] is None
-    assert rolled_up["domain_competencies"] is None
+    assert [c["competency_id"] for c in rolled_up["functional_competencies"]] == ["F1"]
+    assert rolled_up["behavioural_competencies"] == []
+    assert rolled_up["domain_competencies"] == []
 
 
-def test_course_has_only_the_strongest_competency():
+def test_competencies_reaching_the_min_share_are_kept_strongest_first():
     resources = [
         resource("a", 500, area="Functional", functional_competencies=[kcm("F1"), kcm("F2")]),
         resource("b", 500, area="Functional", functional_competencies=[kcm("F1")]),
         resource("c", 100, area="Functional", functional_competencies=[kcm("F3")]),
     ]
-    competency = roll_up_resources(resources)["functional_competencies"]
-    assert (competency["competency_id"], competency["theme"], competency["sub_theme"]) == ("F1", "T", "S-F1")
-    assert competency["confidence"] == 0.91  # F1 91%; F2 (45%) is dropped
+    competencies = roll_up_resources(resources)["functional_competencies"]
+    first = competencies[0]
+    assert (first["competency_id"], first["theme"], first["sub_theme"]) == ("F1", "T", "S-F1")
+    # F1 91%, F2 45%; F3 (9%) is below COURSE_MIN_SHARE
+    assert [(c["competency_id"], c["confidence"]) for c in competencies] == [("F1", 0.91), ("F2", 0.45)]
+
+
+def test_competencies_are_capped_by_course_max_items():
+    ids = [f"F{i}" for i in range(7)]
+    resources = [resource("a", 100, area="Functional", functional_competencies=[kcm(i) for i in ids])]
+    competencies = roll_up_resources(resources)["functional_competencies"]
+    assert len(competencies) == COURSE_MAX_ITEMS["functional_competencies"] == 5
+    assert [c["competency_id"] for c in competencies] == ids[:5]
 
 
 def test_strongest_competency_is_kept_even_with_a_small_share():
     resources = [resource(str(i), 100, area="Functional", functional_competencies=[kcm(f"F{i}")]) for i in range(10)]
-    assert roll_up_resources(resources)["functional_competencies"]["confidence"] == 0.1
+    competencies = roll_up_resources(resources)["functional_competencies"]
+    assert [c["confidence"] for c in competencies] == [0.1]  # the others are below COURSE_MIN_SHARE
 
 
-def test_domain_course_has_one_sector_path_and_no_proficiency_level():
+def test_domain_course_has_sector_paths_and_no_proficiency_level():
     resources = [
         resource("a", 600, domain_competencies=[domain_path(), domain_path("IT", "Cloud", 0.7)]),
         resource("b", 400, domain_competencies=[domain_path(confidence=0.9)]),
     ]
-    competency = roll_up_resources(resources)["domain_competencies"]
-    assert (competency["sector"], competency["subsector"], competency["theme"]) == (
-        "Technology", "Telecommunications", "Next-Generation Telecom Rollout",
-    )
-    assert "proficiency_level" not in competency
+    competencies = roll_up_resources(resources)["domain_competencies"]
+    assert [(c["sector"], c["subsector"], c["theme"]) for c in competencies] == [
+        ("Technology", "Telecommunications", "Next-Generation Telecom Rollout"),  # 96%
+        ("Technology", "IT", "Cloud"),  # 42%
+    ]
+    assert all("proficiency_level" not in c for c in competencies)
 
 
 def test_domain_path_without_a_theme_is_never_chosen():
@@ -302,7 +320,7 @@ def test_domain_path_without_a_theme_is_never_chosen():
         resource("a", 900, domain_competencies=[domain_path(theme=None)]),
         resource("b", 100, domain_competencies=[domain_path("IT", "Cloud")]),
     ]
-    assert roll_up_resources(resources)["domain_competencies"]["theme"] == "Cloud"
+    assert [c["theme"] for c in roll_up_resources(resources)["domain_competencies"]] == ["Cloud"]
 
 
 def test_primary_area_falls_back_to_the_next_area_with_a_competency():
@@ -313,8 +331,8 @@ def test_primary_area_falls_back_to_the_next_area_with_a_competency():
     rolled_up = roll_up_resources(resources)
     assert rolled_up["primary_competency_area"]["value"] == "Behavioural"
     assert rolled_up["primary_competency_area"]["rationale"].startswith("Functional had more support")
-    assert rolled_up["behavioural_competencies"]["competency_id"] == "B1"
-    assert rolled_up["functional_competencies"] is None
+    assert [c["competency_id"] for c in rolled_up["behavioural_competencies"]] == ["B1"]
+    assert rolled_up["functional_competencies"] == []
 
 
 def test_course_without_any_complete_competency_is_skipped():
@@ -325,20 +343,20 @@ def test_course_without_any_complete_competency_is_skipped():
 
 def test_course_metadata_rejects_a_missing_or_extra_competency():
     rolled_up = roll_up_resources([resource("a", 100)])
-    with pytest.raises(ValidationError, match="domain_competencies is missing"):
-        build_course_metadata("c1", {**rolled_up, "domain_competencies": None}, minimal_text())
+    with pytest.raises(ValidationError, match="domain_competencies is empty"):
+        build_course_metadata("c1", {**rolled_up, "domain_competencies": []}, minimal_text())
     with pytest.raises(ValidationError, match="functional_competencies is set"):
-        build_course_metadata("c1", {**rolled_up, "functional_competencies": kcm("F1")}, minimal_text())
+        build_course_metadata("c1", {**rolled_up, "functional_competencies": [kcm("F1")]}, minimal_text())
 
 
-def test_proficiency_level_is_a_weighted_vote():
+def test_proficiency_level_is_a_weighted_vote_per_competency():
     resources = [
-        resource("a", 700, area="Functional", functional_competencies=[kcm("F1", "Tactical")]),
+        resource("a", 700, area="Functional", functional_competencies=[kcm("F1", "Tactical"), kcm("F2", "Strategic")]),
         resource("b", 300, area="Functional", functional_competencies=[kcm("F1", "Strategic")]),
     ]
-    competency = roll_up_resources(resources)["functional_competencies"]
-    assert competency["proficiency_level"] == "Tactical"
-    assert competency["confidence"] == 1.0
+    f1, f2 = roll_up_resources(resources)["functional_competencies"]
+    assert (f1["competency_id"], f1["proficiency_level"], f1["confidence"]) == ("F1", "Tactical", 1.0)
+    assert (f2["competency_id"], f2["proficiency_level"]) == ("F2", "Strategic")
 
 
 def test_exclusions_need_strong_support_and_never_overlap_target_roles():
@@ -483,6 +501,36 @@ def test_build_course_metadata_joins_code_and_text_fields():
     assert metadata.course_summary == "s"
 
 
+RUN_INFO = {"model_used": "gemini-test", "prompt_version": "v9", "resource_prompt_version": "v8"}
+
+
+def test_rollup_row_starts_with_the_key_columns_model_and_prompt_versions():
+    resources = [resource("a", 100)]
+    metadata = build_course_metadata("c1", roll_up_resources(resources), minimal_text())
+    row = build_rollup_row(collect_resource_info(resources), metadata, RUN_INFO)
+    assert list(row)[:5] == ["course_id", "model_used", "prompt_version", "resource_prompt_version", "resource_ids"]
+    assert (row["model_used"], row["prompt_version"], row["resource_prompt_version"]) == ("gemini-test", "v9", "v8")
+    assert list(row)[7:] == COURSE_COLUMNS
+
+
+def test_rollup_file_is_kept_per_model_and_prompt_versions():
+    path = rollup_file_path({"course_id": "c1", **RUN_INFO})
+    assert path.parts[-2:] == ("gemini-test_course-v9_resource-v8", "c1.json")
+
+
+def test_create_table_has_the_run_columns_in_its_primary_key():
+    text = repr(CREATE_TABLE_SQL)  # a psycopg2 Composed; its repr holds the literal SQL parts
+    assert "course_metadata_rollup_v2" in text
+    assert "PRIMARY KEY (course_id, model_used, prompt_version, resource_prompt_version)" in text
+
+
+def test_every_prompt_module_has_its_own_version_and_the_configured_one_is_used():
+    assert set(PROMPT_MODULES) == {"v1", "v2"}
+    assert COURSE_PROMPTS is prompts_for(COURSE_PROMPT_VERSION)
+    with pytest.raises(ValueError, match="Unknown prompt version 'v0'"):
+        prompts_for("v0")
+
+
 # --- keywords_list, rationales and field order -------------------------------------------------
 
 
@@ -539,7 +587,7 @@ def test_rationale_comes_before_value_and_confidence():
     document = build_course_metadata("c1", roll_up_resources(resources), text).model_dump(mode="json")
     assert list(document["learning_level"])[:3] == ["rationale", "value", "confidence"]
     assert list(document["prerequisites"][0])[0] == "topic"
-    assert list(document["functional_competencies"])[0] == "competency_id"
+    assert list(document["functional_competencies"][0])[0] == "competency_id"
     assert list(document["sto_level"])[:4] == ["evidence", "rationale", "value", "confidence"]
 
 
@@ -563,7 +611,7 @@ class FakeConnection:
         return self
 
     def execute(self, query, params):
-        pass
+        self.params = params
 
     def fetchall(self):
         return self.rows
@@ -571,15 +619,21 @@ class FakeConnection:
 
 def test_complete_course_is_fetched():
     resources = [resource("a", 100), resource("b", 200)]
-    assert [r["resource_id"] for r in fetch_course_resources(FakeConnection(resources), "c1")] == ["a", "b"]
+    assert [r["resource_id"] for r in fetch_course_resources(FakeConnection(resources), "c1", RUN_INFO)] == ["a", "b"]
 
 
 def test_course_with_a_resource_missing_metadata_is_skipped_and_lists_the_missing_ids():
     resources = [resource("a", 100), resource("b", 200, course_summary=None), resource("c", 50, course_summary=None)]
     with pytest.raises(CourseSkippedError, match=r"2 of 3 resources have no metadata yet: b, c"):
-        fetch_course_resources(FakeConnection(resources), "c1")
+        fetch_course_resources(FakeConnection(resources), "c1", RUN_INFO)
 
 
 def test_course_with_no_transcribed_resource_is_skipped():
     with pytest.raises(CourseSkippedError, match="no resource with a transcript"):
-        fetch_course_resources(FakeConnection([]), "c1")
+        fetch_course_resources(FakeConnection([]), "c1", RUN_INFO)
+
+
+def test_resource_metadata_is_read_for_the_runs_model_and_resource_prompt_version():
+    connection = FakeConnection([resource("a", 100)])
+    fetch_course_resources(connection, "c1", RUN_INFO)
+    assert connection.params == ("gemini-test", "v8", "c1")

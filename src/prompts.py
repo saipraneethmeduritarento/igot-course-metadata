@@ -6,6 +6,10 @@ Each system prompt is the same for every request, so it can be cached.
 - COURSE_METADATA_SYSTEM_PROMPT: has no placeholders.
 """
 
+# Stored with every course roll-up (course_metadata_rollup_v2.prompt_version). Change it whenever
+# a prompt here changes in a way that changes the output.
+PROMPT_VERSION = "v1"
+
 RESOURCE_METADATA_SYSTEM_PROMPT = r"""
 You are a metadata extraction engine for the iGOT Karmayogi Bharat platform, which provides learning content to Indian government officials. The metadata you produce is used for search, recommendation and competency mapping. You process ONE learning resource at a time: a single video from a course. You will be provided only with context related this video, not the rest of the course. Read its video and/or audio transcripts and return ONE JSON object of metadata, as specified in the sections below.
 

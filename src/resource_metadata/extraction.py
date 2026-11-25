@@ -1,9 +1,13 @@
 """Resource-level metadata extraction.
 
 For each resource: read its transcripts from public.resource_transcripts, ask the LLM for metadata,
-store one row in public.resource_metadata (one column per metadata field),
-and write the full response to <RESOURCE_METADATA_OUTPUT_DIR>/<resource_id>.json.
+store one row in public.resource_metadata_v2 (one column per metadata field), and write the full
+response to <RESOURCE_METADATA_OUTPUT_DIR>/<model>_<prompt_version>/<resource_id>.json.
 public.resource_transcripts itself is only read, never changed.
+
+Every row is keyed by (resource_id, model_used, prompt_version): a run with another model or
+prompt version (RESOURCE_PROMPT_VERSION in src/config.py) adds rows next to the old ones, and
+"already done" means done with this model and prompt version.
 
 Run from the project root:  python -m src.resource_metadata.extraction
 """
@@ -11,27 +15,40 @@ Run from the project root:  python -m src.resource_metadata.extraction
 import asyncio
 import logging
 import re
+from pathlib import Path
 
 import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import Json
 
-from src.config import RESOURCE_METADATA_OUTPUT_DIR, load_db_dsn, load_llm_settings, load_sample_ids
+from src.config import (
+    RESOURCE_METADATA_OUTPUT_DIR,
+    RESOURCE_PROMPT_VERSION,
+    load_db_dsn,
+    load_llm_settings,
+    load_sample_ids,
+)
 from src.llm import GeminiProvider, LLMClient
-from src.prompts import RESOURCE_METADATA_SYSTEM_PROMPT, RESOURCE_METADATA_USER_PROMPT
+from src.prompt_versions import prompts_for
 from src.reference_data import load_designation_names, load_designations, load_kcm_catalogue, load_sgos_tree
 from src.resource_metadata.schema import Designation, ResourceMetadata
 
 logger = logging.getLogger(__name__)
 
 Connection = psycopg2.extensions.connection
+# `model_used` and `prompt_version` of a run.
+RunInfo = dict[str, str]
 
 # Resources to process, from SAMPLE_IDS_PATH. An empty list processes every resource without metadata yet.
 RESOURCE_IDS = load_sample_ids("resource_id")
 BATCH_SIZE = 20  # resources sent to the model together; results are saved after each batch
 
-# Where the metadata is stored: one row per resource, keyed by resource_id.
-METADATA_TABLE = "resource_metadata"
+RESOURCE_PROMPTS = prompts_for(RESOURCE_PROMPT_VERSION)
+
+# Where the metadata is stored: one row per resource, model and prompt version.
+METADATA_TABLE = "resource_metadata_v2"
+# Which model and prompt version produced a row. Together with resource_id, the primary key.
+RUN_COLUMNS = ["model_used", "prompt_version"]
 
 # One table column per ResourceMetadata field. The model never returns resource_id: code owns it.
 METADATA_COLUMNS = list(ResourceMetadata.model_fields)
@@ -48,8 +65,9 @@ class ResourceSkippedError(Exception):
 # --- Choosing resources ------------------------------------------------------------------------
 
 
-def find_pending_resource_ids(connection: Connection) -> list[str]:
-    """Resources that have no metadata yet and have at least one transcript.
+def find_pending_resource_ids(connection: Connection, run_info: RunInfo) -> list[str]:
+    """Resources that have no metadata yet from this model and prompt version, and have at least
+    one transcript.
 
     Resources without any transcript are left out (they are never sent to the model);
     how many were left out is logged.
@@ -57,11 +75,12 @@ def find_pending_resource_ids(connection: Connection) -> list[str]:
     has_transcript = "(btrim(COALESCE(t.video_transcript, '')) <> '' OR btrim(COALESCE(t.audio_transcript, '')) <> '')"
     query = sql.SQL(
         "SELECT t.resource_id, " + has_transcript + " FROM public.resource_transcripts t "
-        "WHERE NOT EXISTS (SELECT 1 FROM public.{table} m WHERE m.resource_id = t.resource_id) "
+        "WHERE NOT EXISTS (SELECT 1 FROM public.{table} m WHERE m.resource_id = t.resource_id "
+        "AND m.model_used = %s AND m.prompt_version = %s) "
         "ORDER BY t.resource_id"
     ).format(table=sql.Identifier(METADATA_TABLE))
     with connection, connection.cursor() as cursor:
-        cursor.execute(query)
+        cursor.execute(query, (run_info["model_used"], run_info["prompt_version"]))
         rows = cursor.fetchall()
 
     pending = [resource_id for resource_id, has in rows if has]
@@ -70,17 +89,19 @@ def find_pending_resource_ids(connection: Connection) -> list[str]:
     return pending
 
 
-def leave_out_done(connection: Connection, resource_ids: list[str]) -> list[str]:
-    """`resource_ids` without the resources that already have metadata (order kept).
+def leave_out_done(connection: Connection, resource_ids: list[str], run_info: RunInfo) -> list[str]:
+    """`resource_ids` without the resources that already have metadata from this model and
+    prompt version (order kept).
 
     A rerun with the same list then only does what is left, instead of paying for every
     resource again.
     """
-    query = sql.SQL("SELECT resource_id FROM public.{table} WHERE resource_id = ANY(%s)").format(
-        table=sql.Identifier(METADATA_TABLE)
-    )
+    query = sql.SQL(
+        "SELECT resource_id FROM public.{table} "
+        "WHERE resource_id = ANY(%s) AND model_used = %s AND prompt_version = %s"
+    ).format(table=sql.Identifier(METADATA_TABLE))
     with connection, connection.cursor() as cursor:
-        cursor.execute(query, (resource_ids,))
+        cursor.execute(query, (resource_ids, run_info["model_used"], run_info["prompt_version"]))
         done = {row[0] for row in cursor.fetchall()}
     if done:
         logger.info("Skipping %d resources that already have metadata.", len(done))
@@ -93,7 +114,7 @@ def leave_out_done(connection: Connection, resource_ids: list[str]) -> list[str]
 def build_system_prompt() -> str:
     """The system prompt with the reference data filled in. Same for every resource."""
     return (
-        RESOURCE_METADATA_SYSTEM_PROMPT.replace("{{KCM_CATALOGUE}}", load_kcm_catalogue())
+        RESOURCE_PROMPTS.RESOURCE_METADATA_SYSTEM_PROMPT.replace("{{KCM_CATALOGUE}}", load_kcm_catalogue())
         .replace("{{SGOS_TREE}}", load_sgos_tree())
         .replace("{{DESIGNATION_LIST}}", load_designations())
     )
@@ -127,7 +148,9 @@ def fetch_user_prompt(connection: Connection, resource_id: str) -> str:
         raise ResourceSkippedError("no usable transcript")
 
     transcript_blocks = [f"<{name}>\n{text}\n</{name}>" for name, text in present.items()]
-    return RESOURCE_METADATA_USER_PROMPT.format(transcripts="\n\n".join(transcript_blocks))
+    return RESOURCE_PROMPTS.RESOURCE_METADATA_USER_PROMPT.format(
+        transcripts="\n\n".join(transcript_blocks)
+    )
 
 
 # --- Calling the model -------------------------------------------------------------------------
@@ -187,26 +210,24 @@ def validate_designations(
 # --- Saving the results ------------------------------------------------------------------------
 
 
+CREATE_TABLE_SQL = sql.SQL(
+    "CREATE TABLE IF NOT EXISTS public.{table} ("
+    "resource_id TEXT NOT NULL, model_used TEXT NOT NULL, prompt_version TEXT NOT NULL, "
+    "extracted_at TIMESTAMPTZ NOT NULL DEFAULT now(), "
+    "PRIMARY KEY (resource_id, model_used, prompt_version))"
+).format(table=sql.Identifier(METADATA_TABLE))
+
+
 def ensure_metadata_table(connection: Connection) -> None:
-    """Create public.resource_metadata if needed, and add any metadata column it lacks.
+    """Create public.resource_metadata_v2 if needed, and add any metadata column it lacks.
 
     A field added to ResourceMetadata later shows up as a new column without dropping the table.
     Run before choosing resources and before calling the model, so a missing table or column
     cannot waste a billed run.
-
-    When the table is first created, any metadata an older version of this script stored in the
-    columns of resource_transcripts is copied into it, so those resources are not extracted again.
     """
     table = sql.Identifier(METADATA_TABLE)
     with connection, connection.cursor() as cursor:
-        cursor.execute("SELECT to_regclass(%s)", (f"public.{METADATA_TABLE}",))
-        is_new = cursor.fetchone()[0] is None
-        cursor.execute(
-            sql.SQL(
-                "CREATE TABLE IF NOT EXISTS public.{} ("
-                "resource_id TEXT PRIMARY KEY, extracted_at TIMESTAMPTZ NOT NULL DEFAULT now())"
-            ).format(table)
-        )
+        cursor.execute(CREATE_TABLE_SQL)
         for column in METADATA_COLUMNS:
             column_type = "TEXT" if column in TEXT_COLUMNS else "JSONB"
             cursor.execute(
@@ -214,62 +235,57 @@ def ensure_metadata_table(connection: Connection) -> None:
                     table, sql.Identifier(column), sql.SQL(column_type)
                 )
             )
-        if is_new:
-            copy_old_metadata(cursor)
 
 
-def copy_old_metadata(cursor) -> None:
-    """Copy the metadata stored in resource_transcripts (by older versions) into resource_metadata."""
-    cursor.execute(
-        "SELECT column_name FROM information_schema.columns "
-        "WHERE table_schema = 'public' AND table_name = 'resource_transcripts'"
-    )
-    old_columns = [column for column in METADATA_COLUMNS if column in {row[0] for row in cursor.fetchall()}]
-    if "course_summary" not in old_columns:
-        return
-    names = sql.SQL(", ").join(sql.Identifier(column) for column in ["resource_id", *old_columns])
-    cursor.execute(
-        sql.SQL(
-            "INSERT INTO public.{table} ({names}) SELECT {names} FROM public.resource_transcripts "
-            "WHERE course_summary IS NOT NULL ON CONFLICT (resource_id) DO NOTHING"
-        ).format(table=sql.Identifier(METADATA_TABLE), names=names)
-    )
-    logger.info("Copied the metadata of %d resources from resource_transcripts.", cursor.rowcount)
-
-
-def save_metadata(connection: Connection, resource_id: str, metadata: ResourceMetadata) -> None:
-    """Insert the resource's row into resource_metadata, or replace it if it was extracted before."""
+def save_metadata(
+    connection: Connection, resource_id: str, metadata: ResourceMetadata, run_info: RunInfo
+) -> None:
+    """Insert the resource's row, or replace it if it was extracted before with the same model
+    and prompt version. A row from another model or prompt version is kept."""
     values = metadata.model_dump(mode="json")
-    columns = ["resource_id", *METADATA_COLUMNS]
-    names = [sql.Identifier(column) for column in columns]
+    key_columns = ["resource_id", *RUN_COLUMNS]
+    columns = [*key_columns, *METADATA_COLUMNS]
     query = sql.SQL(
         "INSERT INTO public.{table} ({columns}) VALUES ({placeholders}) "
-        "ON CONFLICT (resource_id) DO UPDATE SET {assignments}, extracted_at = now()"
+        "ON CONFLICT ({key_columns}) DO UPDATE SET {assignments}, extracted_at = now()"
     ).format(
         table=sql.Identifier(METADATA_TABLE),
-        columns=sql.SQL(", ").join(names),
+        columns=sql.SQL(", ").join(sql.Identifier(column) for column in columns),
         placeholders=sql.SQL(", ").join(sql.Placeholder() * len(columns)),
-        assignments=sql.SQL(", ").join(sql.SQL("{0} = EXCLUDED.{0}").format(name) for name in names[1:]),
+        key_columns=sql.SQL(", ").join(sql.Identifier(column) for column in key_columns),
+        assignments=sql.SQL(", ").join(
+            sql.SQL("{0} = EXCLUDED.{0}").format(sql.Identifier(column))
+            for column in METADATA_COLUMNS
+        ),
     )
     parameters = [
         values[column] if column in TEXT_COLUMNS else Json(values[column]) for column in METADATA_COLUMNS
     ]
 
     with connection, connection.cursor() as cursor:
-        cursor.execute(query, [resource_id, *parameters])
+        cursor.execute(query, [resource_id, *(run_info[c] for c in RUN_COLUMNS), *parameters])
 
 
-def save_metadata_file(resource_id: str, metadata: ResourceMetadata) -> None:
-    """Write the full response to <RESOURCE_METADATA_OUTPUT_DIR>/<resource_id>.json."""
-    RESOURCE_METADATA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = RESOURCE_METADATA_OUTPUT_DIR / f"{resource_id}.json"
+def metadata_file_path(resource_id: str, run_info: RunInfo) -> Path:
+    """<RESOURCE_METADATA_OUTPUT_DIR>/<model_used>_<prompt_version>/<resource_id>.json, so a run
+    with another model or prompt version never overwrites the files of an earlier one."""
+    run_dir = f"{run_info['model_used']}_{run_info['prompt_version']}"
+    return RESOURCE_METADATA_OUTPUT_DIR / run_dir / f"{resource_id}.json"
+
+
+def save_metadata_file(resource_id: str, metadata: ResourceMetadata, run_info: RunInfo) -> None:
+    """Write the full response to its metadata_file_path."""
+    output_path = metadata_file_path(resource_id, run_info)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(metadata.model_dump_json(indent=2), encoding="utf-8")
 
 
 # --- Running -----------------------------------------------------------------------------------
 
 
-async def process_batch(connection: Connection, llm: LLMClient, resource_ids: list[str]) -> int:
+async def process_batch(
+    connection: Connection, llm: LLMClient, resource_ids: list[str], run_info: RunInfo
+) -> int:
     """Process one batch of resources concurrently. Returns how many were saved."""
     prompts: dict[str, str] = {}
     for resource_id in resource_ids:
@@ -291,8 +307,8 @@ async def process_batch(connection: Connection, llm: LLMClient, resource_ids: li
         result = validate_designations(result, valid_names, resource_id)
         try:
             # File first: if the database save fails, the billed response is still kept.
-            save_metadata_file(resource_id, result)
-            save_metadata(connection, resource_id, result)
+            save_metadata_file(resource_id, result, run_info)
+            save_metadata(connection, resource_id, result, run_info)
             saved += 1
         except (ResourceSkippedError, psycopg2.Error, OSError):
             logger.exception("Could not save %s", resource_id)
@@ -304,31 +320,41 @@ async def extract_resource_metadata(
 ) -> None:
     """Extract and store metadata.
 
-    With ids, process those that have no metadata yet (all of them with skip_done=False, which
-    replaces the stored metadata). With no ids, process every resource without metadata.
+    With ids, process those that have no metadata yet from this model and prompt version (all of
+    them with skip_done=False, which replaces their stored metadata). With no ids, process every
+    resource without metadata from this model and prompt version.
     """
+    # Only reads the settings; nothing is billed until the LLM client below is built.
+    settings = load_llm_settings()
+    run_info = {"model_used": settings.model, "prompt_version": RESOURCE_PROMPTS.PROMPT_VERSION}
     connection = psycopg2.connect(load_db_dsn())
     try:
         # First: find_pending_resource_ids reads the table this creates.
         ensure_metadata_table(connection)
         if requested_ids:
-            resource_ids = leave_out_done(connection, requested_ids) if skip_done else requested_ids
+            resource_ids = (
+                leave_out_done(connection, requested_ids, run_info) if skip_done else requested_ids
+            )
         else:
-            resource_ids = find_pending_resource_ids(connection)
+            resource_ids = find_pending_resource_ids(connection, run_info)
         total = len(resource_ids)
         if total == 0:
             logger.info("No resources to process.")
             return
-        logger.info("Processing %d resources", total)
+        logger.info(
+            "Processing %d resources with %s, prompt %s",
+            total,
+            run_info["model_used"],
+            run_info["prompt_version"],
+        )
 
         # Built after the resources are known: this creates the (billed) prompt cache.
-        settings = load_llm_settings()
         llm = LLMClient(GeminiProvider(settings, build_system_prompt()), settings.max_concurrency)
 
         saved = 0
         for start in range(0, total, BATCH_SIZE):
             batch = resource_ids[start : start + BATCH_SIZE]
-            saved += await process_batch(connection, llm, batch)
+            saved += await process_batch(connection, llm, batch, run_info)
             logger.info("Progress: %d/%d processed, %d saved", start + len(batch), total, saved)
         logger.info("Done. Saved metadata for %d of %d resources.", saved, total)
     finally:
