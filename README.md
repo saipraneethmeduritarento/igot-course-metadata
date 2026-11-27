@@ -21,6 +21,9 @@ Run every step from the project root, in this order:
 | 4 | `python -m src.course_metadata.extraction` | `resource_transcripts`, `resource_metadata_v3_1` (rows of the same model and `RESOURCE_PROMPT_VERSION`), content API | table `course_metadata_rollup_v3_1` (one row per course, model, course prompt version and resource prompt version), `data/output/course_metadata_output/<model>_course-<version>_resource-<version>/<course_id>.json` |
 | 5 | `python -m src.utils.create_course_metadata_llm [course_id ...]` | `course_metadata_rollup` (the old table; not yet switched to v2) | table `course_metadata_llm` |
 
+Steps 3 and 4 can also run together, course by course, with `python -m src.pipeline` (see
+[below](#steps-3-and-4-together-course-by-course)).
+
 Optional: `python -m src.utils.build_transcripts_table` exports `resource_transcripts.json` to a
 CSV you can open in Excel. No other step reads this CSV.
 
@@ -55,8 +58,30 @@ CSV you can open in Excel. No other step reads this CSV.
 
 ### Steps 3 and 4 together, course by course
 
-    python -m src.pipeline                          # every course in data/input/courses_run_1_vtt.csv
+    # every course in data/input/courses_run_1_vtt.csv
+    python -m src.pipeline
+
+    # the courses of another CSV
+    python -m src.pipeline --csv data/input/other_courses.csv
+
+    # only some courses of the CSV
+    python -m src.pipeline --ids do_123,do_456
+    python -m src.pipeline --ids-file data/output/course_metadata_output/<model>_course-<version>_resource-<version>/failed_<timestamp>.txt
+
+    # a test run on the first 2 courses not done yet
+    python -m src.pipeline --limit 2
+
+    # faster: 8 model calls in flight, 2 courses at a time
     python -m src.pipeline --concurrency 8 --parallel-courses 2
+
+    # redo courses that are already done (bills them again)
+    python -m src.pipeline --ids do_123 --force
+
+    # use another model (the .env variable that names it)
+    python -m src.pipeline --model-env GEMINI_FLASH_MODEL_NAME
+
+    # all options
+    python -m src.pipeline --help
 
 `src.pipeline` does steps 3 and 4 one course at a time. It extracts the course's resources that
 have no metadata yet (several at once), rolls the course up as soon as they are all done, then
@@ -82,7 +107,9 @@ Options:
 - If a resource fails, its course is not rolled up and is listed in the `failed_*.txt` file (in
   the course output folder). The course's other resources are kept, so a rerun only redoes the
   missing ones.
-- `--force` redoes the chosen courses and extracts all their resources again.
+- `--force` redoes the chosen courses and extracts all their resources again. **This bills them
+  again.**
+- `--model-env VAR`: the `.env` variable that names the model (default `GEMINI_PRO_MODEL_NAME`).
 
 ### Which IDs are processed
 
