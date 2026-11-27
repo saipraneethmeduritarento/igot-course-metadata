@@ -1,7 +1,7 @@
 """Resource-level metadata extraction.
 
 For each resource: read its transcripts from public.resource_transcripts, ask the LLM for metadata,
-store one row in public.resource_metadata_v2 (one column per metadata field), and write the full
+store one row in public.resource_metadata_<version> (one column per metadata field), and write the full
 response to <RESOURCE_METADATA_OUTPUT_DIR>/<model>_<prompt_version>/<resource_id>.json.
 public.resource_transcripts itself is only read, never changed.
 
@@ -9,12 +9,16 @@ Every row is keyed by (resource_id, model_used, prompt_version): a run with anot
 prompt version (RESOURCE_PROMPT_VERSION in src/config.py) adds rows next to the old ones, and
 "already done" means done with this model and prompt version.
 
-Run from the project root:  python -m src.resource_metadata.extraction
+Run from the project root (see --help for the options):
+    python -m src.resource_metadata.extraction                      # the resources in the sample CSV
+    python -m src.resource_metadata.extraction --all --concurrency 8 --batch-size 100
+    python -m src.resource_metadata.extraction --ids-file <failed_*.txt>
 """
 
 import asyncio
 import logging
 import re
+import sys
 from pathlib import Path
 
 import psycopg2
@@ -22,16 +26,25 @@ from psycopg2 import sql
 from psycopg2.extras import Json
 
 from src.config import (
+    DEFAULT_MODEL_ENV_VAR,
     RESOURCE_METADATA_OUTPUT_DIR,
     RESOURCE_PROMPT_VERSION,
     load_db_dsn,
     load_llm_settings,
-    load_sample_ids,
 )
 from src.llm import GeminiProvider, LLMClient
 from src.prompt_versions import prompts_for
 from src.reference_data import load_designation_names, load_designations, load_kcm_catalogue, load_sgos_tree
 from src.resource_metadata.schema import Designation, ResourceMetadata
+from src.runner import (
+    RunSummary,
+    build_arg_parser,
+    log_summary,
+    parse_args,
+    run_pool,
+    selected_ids,
+    write_retry_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,20 +52,22 @@ Connection = psycopg2.extensions.connection
 # `model_used` and `prompt_version` of a run.
 RunInfo = dict[str, str]
 
-# Resources to process, from SAMPLE_IDS_PATH. An empty list processes every resource without metadata yet.
-RESOURCE_IDS = load_sample_ids("resource_id")
-BATCH_SIZE = 20  # resources sent to the model together; results are saved after each batch
+# Default for --batch-size: resources read from the database at a time. The number of model calls
+# in flight is --concurrency (default MAX_CONCURRENCY), not this.
+DEFAULT_BATCH_SIZE = 20
 
 RESOURCE_PROMPTS = prompts_for(RESOURCE_PROMPT_VERSION)
 
-# Where the metadata is stored: one row per resource, model and prompt version.
-METADATA_TABLE = "resource_metadata_v2"
+# Where the metadata is stored: one row per resource, model and prompt version. Named after the
+# prompt version, so each version has its own table (resource_metadata_v3_1 for v3.1: a "." in
+# the version is written as "_", so the name needs no quoting in SQL).
+METADATA_TABLE = f"resource_metadata_{RESOURCE_PROMPT_VERSION.replace('.', '_')}"
 # Which model and prompt version produced a row. Together with resource_id, the primary key.
 RUN_COLUMNS = ["model_used", "prompt_version"]
 
 # One table column per ResourceMetadata field. The model never returns resource_id: code owns it.
 METADATA_COLUMNS = list(ResourceMetadata.model_fields)
-TEXT_COLUMNS = {"course_summary", "description"}  # every other metadata column is JSONB
+TEXT_COLUMNS = {"course_coverage", "description"}  # every other metadata column is JSONB
 
 # Matches `[Segment: Video Time: ...]`, with or without the surrounding `**`.
 SEGMENT_MARKER = re.compile(r"(?:\*\*)?\[Segment:[^\]]*\](?:\*\*)?")
@@ -125,20 +140,33 @@ def clean_video_transcript(text: str | None) -> str:
     return re.sub(r"\s+", " ", SEGMENT_MARKER.sub(" ", text or "")).strip()
 
 
-def fetch_user_prompt(connection: Connection, resource_id: str) -> str:
-    """Read the resource's transcripts from the database and build the user prompt."""
+def fetch_user_prompts(connection: Connection, resource_ids: list[str]) -> dict[str, str]:
+    """Read the transcripts of `resource_ids` in one query and build each user prompt.
+
+    A resource that is not in resource_transcripts, or has no usable transcript, is left out
+    (and logged).
+    """
     with connection, connection.cursor() as cursor:
         cursor.execute(
-            "SELECT video_transcript, audio_transcript FROM public.resource_transcripts "
-            "WHERE resource_id = %s",
-            (resource_id,),
+            "SELECT resource_id, video_transcript, audio_transcript "
+            "FROM public.resource_transcripts WHERE resource_id = ANY(%s)",
+            (resource_ids,),
         )
-        row = cursor.fetchone()
+        rows = {resource_id: transcripts for resource_id, *transcripts in cursor.fetchall()}
 
-    if row is None:
-        raise ResourceSkippedError("resource not found in resource_transcripts")
+    prompts: dict[str, str] = {}
+    for resource_id in resource_ids:
+        try:
+            if resource_id not in rows:
+                raise ResourceSkippedError("resource not found in resource_transcripts")
+            prompts[resource_id] = build_user_prompt(*rows[resource_id])
+        except ResourceSkippedError as error:
+            logger.warning("Skipped %s: %s", resource_id, error)
+    return prompts
 
-    video_transcript, audio_transcript = row
+
+def build_user_prompt(video_transcript: str | None, audio_transcript: str | None) -> str:
+    """The user prompt for a resource's transcripts. Raises ResourceSkippedError if both are empty."""
     transcripts = {
         "video_transcript": clean_video_transcript(video_transcript),
         "audio_transcript": (audio_transcript or "").strip(),
@@ -151,16 +179,6 @@ def fetch_user_prompt(connection: Connection, resource_id: str) -> str:
     return RESOURCE_PROMPTS.RESOURCE_METADATA_USER_PROMPT.format(
         transcripts="\n\n".join(transcript_blocks)
     )
-
-
-# --- Calling the model -------------------------------------------------------------------------
-
-
-async def extract_metadata(
-    llm: LLMClient, user_prompts: list[str]
-) -> list[ResourceMetadata | Exception]:
-    """Ask the model for the metadata of each prompt. A failed prompt gives its exception."""
-    return await llm.agenerate_many(user_prompts, ResourceMetadata)
 
 
 # --- Checking designations ---------------------------------------------------------------------
@@ -219,7 +237,7 @@ CREATE_TABLE_SQL = sql.SQL(
 
 
 def ensure_metadata_table(connection: Connection) -> None:
-    """Create public.resource_metadata_v2 if needed, and add any metadata column it lacks.
+    """Create public.resource_metadata_<version> if needed, and add any metadata column it lacks.
 
     A field added to ResourceMetadata later shows up as a new column without dropping the table.
     Run before choosing resources and before calling the model, so a missing table or column
@@ -266,11 +284,16 @@ def save_metadata(
         cursor.execute(query, [resource_id, *(run_info[c] for c in RUN_COLUMNS), *parameters])
 
 
+def run_output_dir(run_info: RunInfo) -> Path:
+    """<RESOURCE_METADATA_OUTPUT_DIR>/<model_used>_<prompt_version>: the files of one model and
+    prompt version, and the failed_*.txt id lists of its runs."""
+    return RESOURCE_METADATA_OUTPUT_DIR / f"{run_info['model_used']}_{run_info['prompt_version']}"
+
+
 def metadata_file_path(resource_id: str, run_info: RunInfo) -> Path:
-    """<RESOURCE_METADATA_OUTPUT_DIR>/<model_used>_<prompt_version>/<resource_id>.json, so a run
-    with another model or prompt version never overwrites the files of an earlier one."""
-    run_dir = f"{run_info['model_used']}_{run_info['prompt_version']}"
-    return RESOURCE_METADATA_OUTPUT_DIR / run_dir / f"{resource_id}.json"
+    """<run_output_dir>/<resource_id>.json, so a run with another model or prompt version never
+    overwrites the files of an earlier one."""
+    return run_output_dir(run_info) / f"{resource_id}.json"
 
 
 def save_metadata_file(resource_id: str, metadata: ResourceMetadata, run_info: RunInfo) -> None:
@@ -283,84 +306,105 @@ def save_metadata_file(resource_id: str, metadata: ResourceMetadata, run_info: R
 # --- Running -----------------------------------------------------------------------------------
 
 
-async def process_batch(
-    connection: Connection, llm: LLMClient, resource_ids: list[str], run_info: RunInfo
-) -> int:
-    """Process one batch of resources concurrently. Returns how many were saved."""
-    prompts: dict[str, str] = {}
-    for resource_id in resource_ids:
-        try:
-            prompts[resource_id] = fetch_user_prompt(connection, resource_id)
-        except ResourceSkippedError as error:
-            logger.warning("Skipped %s: %s", resource_id, error)
-        except psycopg2.Error:
-            logger.exception("Could not read %s", resource_id)
-
-    results = await extract_metadata(llm, list(prompts.values()))
-
-    valid_names = load_designation_names()
-    saved = 0
-    for resource_id, result in zip(prompts, results):
-        if isinstance(result, Exception):
-            logger.error("Extraction failed for %s: %r", resource_id, result)
-            continue
-        result = validate_designations(result, valid_names, resource_id)
-        try:
-            # File first: if the database save fails, the billed response is still kept.
-            save_metadata_file(resource_id, result, run_info)
-            save_metadata(connection, resource_id, result, run_info)
-            saved += 1
-        except (ResourceSkippedError, psycopg2.Error, OSError):
-            logger.exception("Could not save %s", resource_id)
-    return saved
+async def process_resource(
+    connection: Connection,
+    llm: LLMClient,
+    resource_id: str,
+    user_prompt: str,
+    run_info: RunInfo,
+    valid_names: frozenset[str],
+) -> None:
+    """Ask the model for the resource's metadata and save it. Raises if either fails."""
+    metadata = await llm.agenerate(user_prompt, ResourceMetadata)
+    metadata = validate_designations(metadata, valid_names, resource_id)
+    # File first: if the database save fails, the billed response is still kept.
+    save_metadata_file(resource_id, metadata, run_info)
+    save_metadata(connection, resource_id, metadata, run_info)
 
 
 async def extract_resource_metadata(
-    requested_ids: list[str] | None = None, skip_done: bool = True
-) -> None:
+    requested_ids: list[str] | None = None,
+    skip_done: bool = True,
+    *,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    concurrency: int | None = None,
+    limit: int | None = None,
+    model_env_var: str = DEFAULT_MODEL_ENV_VAR,
+) -> RunSummary:
     """Extract and store metadata.
 
     With ids, process those that have no metadata yet from this model and prompt version (all of
-    them with skip_done=False, which replaces their stored metadata). With no ids, process every
-    resource without metadata from this model and prompt version.
+    them with skip_done=False, which replaces their stored metadata). With None, process every
+    resource without metadata from this model and prompt version. `limit` caps how many are
+    processed; `concurrency` (default MAX_CONCURRENCY) how many model calls run at once.
     """
     # Only reads the settings; nothing is billed until the LLM client below is built.
-    settings = load_llm_settings()
+    settings = load_llm_settings(model_env_var)
+    concurrency = concurrency or settings.max_concurrency
     run_info = {"model_used": settings.model, "prompt_version": RESOURCE_PROMPTS.PROMPT_VERSION}
     connection = psycopg2.connect(load_db_dsn())
     try:
         # First: find_pending_resource_ids reads the table this creates.
         ensure_metadata_table(connection)
-        if requested_ids:
-            resource_ids = (
-                leave_out_done(connection, requested_ids, run_info) if skip_done else requested_ids
-            )
-        else:
+        if requested_ids is None:
             resource_ids = find_pending_resource_ids(connection, run_info)
-        total = len(resource_ids)
-        if total == 0:
+        elif skip_done:
+            resource_ids = leave_out_done(connection, requested_ids, run_info)
+        else:
+            resource_ids = list(requested_ids)
+        resource_ids = resource_ids[:limit] if limit else resource_ids
+        if not resource_ids:
             logger.info("No resources to process.")
-            return
+            return RunSummary()
         logger.info(
-            "Processing %d resources with %s, prompt %s",
-            total,
+            "Processing %d resources with %s, prompt %s: %d calls at a time, batches of %d",
+            len(resource_ids),
             run_info["model_used"],
             run_info["prompt_version"],
+            concurrency,
+            batch_size,
         )
 
         # Built after the resources are known: this creates the (billed) prompt cache.
-        llm = LLMClient(GeminiProvider(settings, build_system_prompt()), settings.max_concurrency)
+        llm = LLMClient(GeminiProvider(settings, build_system_prompt()), concurrency, settings.retry)
+        valid_names = load_designation_names()
 
-        saved = 0
-        for start in range(0, total, BATCH_SIZE):
-            batch = resource_ids[start : start + BATCH_SIZE]
-            saved += await process_batch(connection, llm, batch, run_info)
-            logger.info("Progress: %d/%d processed, %d saved", start + len(batch), total, saved)
-        logger.info("Done. Saved metadata for %d of %d resources.", saved, total)
+        async def process_one(resource_id: str, user_prompt: str) -> None:
+            await process_resource(connection, llm, resource_id, user_prompt, run_info, valid_names)
+
+        summary = await run_pool(
+            resource_ids,
+            lambda batch: fetch_user_prompts(connection, batch),
+            process_one,
+            concurrency=concurrency,
+            batch_size=batch_size,
+            label="resources",
+        )
+        retry_file = write_retry_file(summary, run_output_dir(run_info))
+        log_summary(summary, "resources", retry_file)
+        return summary
     finally:
         connection.close()
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser(
+        "Extract resource-level metadata with the LLM.", DEFAULT_BATCH_SIZE, "resources"
+    )
+    args = parse_args(parser, argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    asyncio.run(extract_resource_metadata(RESOURCE_IDS))
+    summary = asyncio.run(
+        extract_resource_metadata(
+            selected_ids(args, "resource_id"),
+            skip_done=not args.force,
+            batch_size=args.batch_size,
+            concurrency=args.concurrency,
+            limit=args.limit,
+            model_env_var=args.model_env,
+        )
+    )
+    return summary.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

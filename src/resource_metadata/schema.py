@@ -131,10 +131,10 @@ class Designation(BaseModel):
 
 class ResourceMetadata(BaseModel):
     presenters: list[Presenter]
+    course_coverage: str
     description: str
-    course_summary: str
     learning_outcomes: list[str]
-    keywords: list[Keyword]
+    keywords_list: list[Keyword]
     reference_resources: list[ReferenceResource]
     learning_level: LearningLevel
     learning_mode: LearningMode

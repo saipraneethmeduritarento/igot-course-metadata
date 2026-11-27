@@ -7,10 +7,10 @@ PROMPT_VERSION) and add it to PROMPT_MODULES.
 
 from types import ModuleType
 
-from src import prompts, prompts_v2
+from src import prompts, prompts_v2, prompts_v3, prompts_v3_1
 
 PROMPT_MODULES: dict[str, ModuleType] = {
-    module.PROMPT_VERSION: module for module in (prompts, prompts_v2)
+    module.PROMPT_VERSION: module for module in (prompts, prompts_v2, prompts_v3, prompts_v3_1)
 }
 
 

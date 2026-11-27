@@ -24,7 +24,7 @@ CREATE TABLE public.resource_transcripts (
     audio_transcript         TEXT
 )
 """
-# Transcripts only. The resource metadata is stored in its own table, public.resource_metadata_v2,
+# Transcripts only. The resource metadata is stored in its own table, public.resource_metadata_<version>,
 # created and filled by src/resource_metadata/extraction.py.
 
 INSERT_SQL = """

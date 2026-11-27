@@ -8,13 +8,18 @@ import pytest
 from google.genai import errors
 from pydantic import BaseModel
 
-from src.llm import GeminiProvider, LLMClient
+from src import llm as llm_module
+from src.config import RetryPolicy
+from src.llm import GeminiProvider, InvalidResponseError, LLMClient, QuotaExhaustedError
 from src.prompts import RESOURCE_METADATA_SYSTEM_PROMPT
 from src.resource_metadata.schema import ResourceMetadata
 
 
 class Answer(BaseModel):
     value: int
+
+
+NO_WAIT = RetryPolicy(initial_delay_seconds=0, max_delay_seconds=0)
 
 
 class FakeProvider:
@@ -32,16 +37,17 @@ class FakeProvider:
 
 @pytest.fixture
 def client():
-    return LLMClient(FakeProvider(), max_concurrency=2)
+    return LLMClient(FakeProvider(), max_concurrency=2, retry=NO_WAIT)
 
 
 def test_generate_returns_validated_model(client):
     assert client.generate("7", Answer) == Answer(value=7)
 
 
-def test_generate_rejects_answer_that_breaks_the_schema(client):
-    with pytest.raises(ValueError):
-        client.generate("not-a-number", Answer)
+def test_generate_rejects_answer_that_breaks_the_schema():
+    client = LLMClient(ScriptedProvider({"m": ['{"value": "not a number"}']}), retry=NO_WAIT)
+    with pytest.raises(InvalidResponseError, match="does not match Answer"):
+        client.generate("m", Answer)
 
 
 def test_generate_many_keeps_order_and_returns_failures(client):
@@ -161,3 +167,167 @@ def test_a_second_expiry_is_raised_not_retried_forever():
     with pytest.raises(errors.ClientError, match="expired"):
         provider.generate("hi", {})
     assert fake.calls == ["cache-1", "cache-2"]
+
+
+# --- LLMClient: retrying ---------------------------------------------------------------------------
+
+def api_error(code, message="error"):
+    error_class = errors.ServerError if code >= 500 else errors.ClientError
+    return error_class(code, {"error": {"code": code, "message": message}})
+
+
+class ScriptedProvider:
+    """Answers each message from its script, in turn: an exception is raised, text is returned.
+    The last entry repeats. `on_error` is called just before an exception is raised."""
+
+    def __init__(self, scripts, on_error=lambda: None):
+        self.scripts = {message: list(script) for message, script in scripts.items()}
+        self.calls = []
+        self.on_error = on_error
+
+    def _next(self, user_message):
+        self.calls.append(user_message)
+        script = self.scripts[user_message]
+        answer = script.pop(0) if len(script) > 1 else script[0]
+        if isinstance(answer, Exception):
+            self.on_error()
+            raise answer
+        return answer
+
+    def generate(self, user_message, json_schema):
+        return self._next(user_message)
+
+    async def agenerate(self, user_message, json_schema):
+        await asyncio.sleep(0)
+        return self._next(user_message)
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """A fake clock: waiting moves it on at once. `clock.waits` lists every wait, in seconds."""
+
+    class Clock:
+        now = 0.0
+        waits = []
+
+    def sleep(seconds):
+        Clock.waits.append(round(seconds, 3))
+        Clock.now += seconds
+
+    async def asleep(seconds):
+        Clock.waits.append(round(seconds, 3))
+        await asyncio.sleep(0)  # let the other calls run, as a real wait would
+        Clock.now += seconds
+
+    Clock.waits = []
+    monkeypatch.setattr(llm_module, "_now", lambda: Clock.now)
+    monkeypatch.setattr(llm_module, "_sleep", sleep)
+    monkeypatch.setattr(llm_module, "_asleep", asleep)
+    monkeypatch.setattr(llm_module, "_jitter", lambda: 1.0)
+    return Clock
+
+
+POLICY = RetryPolicy(attempts=4, initial_delay_seconds=5, max_delay_seconds=12, quota_give_up_after=2)
+OK = '{"value": 1}'
+
+
+def test_a_server_error_is_retried_with_growing_waits(clock):
+    provider = ScriptedProvider({"m": [api_error(503), api_error(500), api_error(503), OK]})
+    client = LLMClient(provider, retry=POLICY)
+
+    assert asyncio.run(client.agenerate("m", Answer)) == Answer(value=1)
+    assert len(provider.calls) == 4
+    assert [w for w in clock.waits if w] == [5, 10, 12]  # doubled, capped at max_delay
+
+
+def test_network_errors_and_timeouts_are_retried(clock):
+    import httpx2
+
+    provider = ScriptedProvider({"m": [httpx2.ConnectError("refused"), TimeoutError(), OK]})
+    assert LLMClient(provider, retry=POLICY).generate("m", Answer) == Answer(value=1)
+    assert len(provider.calls) == 3
+
+
+@pytest.mark.parametrize("code", [400, 403, 404])
+def test_a_request_error_is_not_retried(clock, code):
+    provider = ScriptedProvider({"m": [api_error(code)]})
+    call = LLMClient(provider, retry=POLICY).agenerate("m", Answer)
+    with pytest.raises(errors.ClientError):
+        asyncio.run(call)
+    assert provider.calls == ["m"]
+
+
+def test_an_invalid_answer_is_tried_only_invalid_response_attempts_times(clock):
+    provider = ScriptedProvider({"m": ["", "not json"]})
+    policy = RetryPolicy(attempts=6, initial_delay_seconds=1, invalid_response_attempts=3)
+    call = LLMClient(provider, retry=policy).agenerate("m", Answer)
+    with pytest.raises(InvalidResponseError):
+        asyncio.run(call)
+    assert len(provider.calls) == 3
+
+
+def test_a_server_error_is_raised_after_the_last_attempt(clock):
+    provider = ScriptedProvider({"m": [api_error(503)]})
+    call = LLMClient(provider, retry=POLICY).agenerate("m", Answer)
+    with pytest.raises(errors.ServerError):
+        asyncio.run(call)
+    assert len(provider.calls) == POLICY.attempts
+
+
+def test_a_quota_error_pauses_every_call_not_only_its_own(clock):
+    async def run():
+        got_429 = asyncio.Event()
+        provider = ScriptedProvider({"a": [api_error(429), OK], "b": [OK]}, on_error=got_429.set)
+        client = LLMClient(provider, retry=POLICY)
+
+        async def b_after_the_429():
+            await got_429.wait()
+            return await client.agenerate("b", Answer)
+
+        return await asyncio.gather(client.agenerate("a", Answer), b_after_the_429())
+
+    assert asyncio.run(run()) == [Answer(value=1), Answer(value=1)]
+    # "a" waits out the pause, and so does "b", which never got a 429 itself.
+    assert [w for w in clock.waits if w] == [5, 5]
+
+
+def test_the_run_gives_up_when_the_quota_stays_exhausted(clock):
+    provider = ScriptedProvider({"m": [api_error(429)]})
+    client = LLMClient(provider, retry=POLICY)
+
+    first, second, third = (client.agenerate("m", Answer) for _ in range(3))
+    with pytest.raises(errors.ClientError):  # first request out of attempts: it alone fails
+        asyncio.run(first)
+    with pytest.raises(QuotaExhaustedError):  # second in a row: quota_give_up_after reached
+        asyncio.run(second)
+    calls = len(provider.calls)
+    with pytest.raises(QuotaExhaustedError):  # from now on the model is not called at all
+        asyncio.run(third)
+    assert len(provider.calls) == calls == 2 * POLICY.attempts
+
+
+def test_a_success_resets_the_quota_give_up_count(clock):
+    provider = ScriptedProvider({"quota": [api_error(429)], "ok": [OK]})
+    client = LLMClient(provider, retry=POLICY)
+    for _ in range(3):
+        with pytest.raises(errors.ClientError):
+            client.generate("quota", Answer)
+        client.generate("ok", Answer)
+    assert not client.quota_exhausted
+
+
+def test_the_sdk_does_not_retry_on_its_own(monkeypatch):
+    """LLMClient does the retrying; SDK retries on top would multiply the attempts."""
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.caches = SimpleNamespace(create=lambda **_: SimpleNamespace(name="cache-1"))
+
+    monkeypatch.setattr(llm_module.genai, "Client", FakeClient)
+    settings = SimpleNamespace(
+        project="p", location="global", timeout_seconds=1, model="m", cache_ttl_seconds=60
+    )
+    GeminiProvider(settings, "system")
+    assert captured["http_options"].retry_options.attempts == 1

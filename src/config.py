@@ -53,13 +53,56 @@ COURSE_MAX_ITEMS = {
     "domain_competencies": 5,
 }
 
-# Which prompt module each pipeline uses: "v1" (src/prompts.py) or "v2" (src/prompts_v2.py).
-# Resource extraction: stored in resource_metadata_v2.prompt_version, next to `model_used`.
-RESOURCE_PROMPT_VERSION = "v2"
-# Course roll-up: stored in course_metadata_rollup_v2.prompt_version. The roll-up reads the
+# Which prompt module each pipeline uses: "v1" (src/prompts.py), "v2" (src/prompts_v2.py),
+# "v3" (src/prompts_v3.py) or "v3.1" (src/prompts_v3_1.py). Each version also names its table:
+# resource_metadata_<RESOURCE_PROMPT_VERSION> and course_metadata_rollup_<COURSE_PROMPT_VERSION>,
+# with "." written as "_" (so v3.1 writes resource_metadata_v3_1 and course_metadata_rollup_v3_1;
+# the v3 tables are kept).
+# Resource extraction: stored in resource_metadata_<version>.prompt_version, next to `model_used`.
+RESOURCE_PROMPT_VERSION = "v3.1"
+# Course roll-up: stored in course_metadata_rollup_<version>.prompt_version. The roll-up reads the
 # resource rows of RESOURCE_PROMPT_VERSION and of the same model, and stores that version in
-# course_metadata_rollup_v2.resource_prompt_version.
-COURSE_PROMPT_VERSION = "v2"
+# course_metadata_rollup_<version>.resource_prompt_version.
+COURSE_PROMPT_VERSION = "v3.1"
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """How a failed model call is tried again (see LLMClient in src/llm.py).
+
+    A quota error (429), a server error (5xx), a timeout or a network error is retried up to
+    `attempts` times in all, waiting `initial_delay_seconds`, then twice as long each time, up to
+    `max_delay_seconds` (with some jitter). An answer that is empty or breaks the schema is tried
+    up to `invalid_response_attempts` times. Anything else (400, 403, 404...) is not retried.
+
+    A quota error pauses every call, not just the one that got it. When `quota_give_up_after`
+    requests in a row have used every attempt on quota errors, the run stops: the quota is gone
+    for now, and a later run carries on from where this one stopped.
+    """
+
+    attempts: int = 6
+    initial_delay_seconds: float = 5.0
+    max_delay_seconds: float = 120.0
+    invalid_response_attempts: int = 3
+    quota_give_up_after: int = 3
+
+
+def load_retry_policy() -> RetryPolicy:
+    """Read the retry policy from environment variables (.env). Every one is optional."""
+    defaults = RetryPolicy()
+    return RetryPolicy(
+        attempts=int(os.environ.get("LLM_RETRY_ATTEMPTS", defaults.attempts)),
+        initial_delay_seconds=float(
+            os.environ.get("LLM_RETRY_INITIAL_DELAY", defaults.initial_delay_seconds)
+        ),
+        max_delay_seconds=float(os.environ.get("LLM_RETRY_MAX_DELAY", defaults.max_delay_seconds)),
+        invalid_response_attempts=int(
+            os.environ.get("LLM_RETRY_INVALID_RESPONSE_ATTEMPTS", defaults.invalid_response_attempts)
+        ),
+        quota_give_up_after=int(
+            os.environ.get("LLM_QUOTA_GIVE_UP_AFTER", defaults.quota_give_up_after)
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -72,12 +115,15 @@ class LLMSettings:
     temperature: float
     max_output_tokens: int
     timeout_seconds: int
-    max_attempts: int
-    max_concurrency: int
+    max_concurrency: int  # default for --concurrency: requests in flight at the same time
     cache_ttl_seconds: int = 3600
+    retry: RetryPolicy = RetryPolicy()
 
 
-def load_llm_settings(model_env_var: str = "GEMINI_PRO_MODEL_NAME") -> LLMSettings:
+DEFAULT_MODEL_ENV_VAR = "GEMINI_PRO_MODEL_NAME"
+
+
+def load_llm_settings(model_env_var: str = DEFAULT_MODEL_ENV_VAR) -> LLMSettings:
     """Read the LLM settings from environment variables (.env).
 
     Pass another variable name to use another model, e.g. "GEMINI_FLASH_MODEL_NAME".
@@ -89,8 +135,8 @@ def load_llm_settings(model_env_var: str = "GEMINI_PRO_MODEL_NAME") -> LLMSettin
         temperature=float(os.environ["LLM_TEMPERATURE"]),
         max_output_tokens=int(os.environ["LLM_MAX_OUTPUT_TOKENS"]),
         timeout_seconds=int(os.environ["LLM_TIMEOUT_SECONDS_META"]),
-        max_attempts=int(os.environ["MAX_ATTEMPTS"]),
         max_concurrency=int(os.environ["MAX_CONCURRENCY"]),
+        retry=load_retry_policy(),
     )
 
 

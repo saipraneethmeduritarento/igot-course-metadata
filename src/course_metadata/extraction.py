@@ -2,7 +2,7 @@
 
 For each course:
   1. Read its resources from public.resource_transcripts, with their metadata from
-     public.resource_metadata_v2: only the rows of the same model and of RESOURCE_PROMPT_VERSION.
+     public.resource_metadata_<version>: only the rows of the same model and of RESOURCE_PROMPT_VERSION.
      A course is rolled up only when every resource that has a transcript already has such a
      row; otherwise it is skipped.
   2. Decide in code every field that depends on duration. A value's "share" is the sum of
@@ -17,19 +17,22 @@ For each course:
   3. Ask the model only for the text fields (CourseTextMetadata), from the resources' own text
      fields. The decisions of step 2 are not sent, so they cannot bias the text. The prompt
      module is chosen by COURSE_PROMPT_VERSION in src/config.py.
-  4. Build `keywords_list` from the model's keywords.
-  5. Store one row in public.course_metadata_rollup_v2, keyed by (course_id, model_used,
+  4. Build `keywords` from the model's `keywords_list`.
+  5. Store one row in public.course_metadata_rollup_<version>, keyed by (course_id, model_used,
      prompt_version, resource_prompt_version), so a run with another model or prompt version
      adds rows next to the old ones. Write the same row to
      <COURSE_METADATA_OUTPUT_DIR>/<model>_course-<version>_resource-<version>/<course_id>.json.
 
-Run src.resource_metadata.extraction first. Then, from the project root:
-    python -m src.course_metadata.extraction
+Run src.resource_metadata.extraction first. Then, from the project root (see --help):
+    python -m src.course_metadata.extraction                        # the courses in the sample CSV
+    python -m src.course_metadata.extraction --all --concurrency 8 --batch-size 20
+    python -m src.course_metadata.extraction --ids-file <failed_*.txt>
 """
 
 import asyncio
 import json
 import logging
+import sys
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -39,10 +42,9 @@ from typing import Any, NamedTuple
 import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import Json
-from pydantic import ValidationError
 
 from src.config import (
-    load_sample_ids,
+    DEFAULT_MODEL_ENV_VAR,
     COURSE_EXCLUSION_MIN_SHARE,
     COURSE_LEARNING_MODE_MIN_SHARE,
     COURSE_MAX_ITEMS,
@@ -71,6 +73,15 @@ from src.resource_metadata.extraction import METADATA_COLUMNS as RESOURCE_COLUMN
 from src.resource_metadata.extraction import METADATA_TABLE as RESOURCE_METADATA_TABLE
 from src.resource_metadata.extraction import TEXT_COLUMNS
 from src.resource_metadata.schema import Keyword
+from src.runner import (
+    RunSummary,
+    build_arg_parser,
+    log_summary,
+    parse_args,
+    run_pool,
+    selected_ids,
+    write_retry_file,
+)
 from src.utils.text_matching import (
     has_name_prefix,
     is_short_form,
@@ -90,14 +101,15 @@ Entries = list[tuple[float, dict[str, Any]]]
 
 # --- Run settings -----------------------------------------------------------------------------
 
-# Courses to process. Leave empty to process every complete course that has no roll-up yet.
-COURSE_IDS: list[str] = load_sample_ids("course_id")
-
-BATCH_SIZE = 5  # courses sent to the model together; results are saved after each batch
+# Default for --batch-size: courses prepared (read from the database and the content API) at a
+# time. The number of model calls in flight is --concurrency (default MAX_CONCURRENCY), not this.
+DEFAULT_BATCH_SIZE = 5
 
 COURSE_PROMPTS = prompts_for(COURSE_PROMPT_VERSION)
 
-ROLLUP_TABLE = "course_metadata_rollup_v2"
+# Named after the course prompt version, so each version has its own table
+# (course_metadata_rollup_v3_1 for v3.1: a "." in the version is written as "_").
+ROLLUP_TABLE = f"course_metadata_rollup_{COURSE_PROMPT_VERSION.replace('.', '_')}"
 # What produced a row: the model (of both the resource rows and the roll-up), the course prompt
 # version and the prompt version of the resource rows it was rolled up from. Together with
 # course_id, the primary key.
@@ -110,7 +122,7 @@ RunInfo = dict[str, str]
 # The model writes these fields. Code decides every other CourseMetadata field.
 TEXT_FIELDS = list(CourseTextMetadata.model_fields)
 
-# One roll-up column per CourseMetadata field. TEXT for the summary and description, else JSONB.
+# One roll-up column per CourseMetadata field. TEXT for the description and course coverage, else JSONB.
 COURSE_COLUMNS = [name for name in CourseMetadata.model_fields if name != "course_id"]
 JSONB_COLUMNS = {column for column in COURSE_COLUMNS if column not in TEXT_COLUMNS}
 # The resource_info list columns are JSONB too.
@@ -205,7 +217,7 @@ class RankedGroup(NamedTuple):
 
 
 def create_rollup_table(connection: Connection) -> None:
-    """Create public.course_metadata_rollup_v2 if it does not exist."""
+    """Create public.course_metadata_rollup_<version> if it does not exist."""
     with connection, connection.cursor() as cursor:
         cursor.execute(CREATE_TABLE_SQL)
 
@@ -224,7 +236,7 @@ def find_pending_course_ids(connection: Connection, run_info: RunInfo) -> list[s
         "WHERE t.course_id IS NOT NULL AND {has_transcript} "
         "AND t.course_id NOT IN (SELECT course_id FROM public.{rollup_table} "
         "WHERE model_used = %s AND prompt_version = %s AND resource_prompt_version = %s) "
-        "GROUP BY t.course_id HAVING bool_and(m.course_summary IS NOT NULL) ORDER BY t.course_id"
+        "GROUP BY t.course_id HAVING bool_and(m.description IS NOT NULL) ORDER BY t.course_id"
     ).format(
         join_metadata=RESOURCE_METADATA_JOIN_SQL,
         rollup_table=sql.Identifier(ROLLUP_TABLE),
@@ -239,38 +251,69 @@ def find_pending_course_ids(connection: Connection, run_info: RunInfo) -> list[s
         return [row[0] for row in cursor.fetchall()]
 
 
+def leave_out_done(connection: Connection, course_ids: list[str], run_info: RunInfo) -> list[str]:
+    """`course_ids` without the courses that already have a roll-up from this run (`run_info`),
+    order kept. A rerun with the same list then only does what is left."""
+    query = sql.SQL(
+        "SELECT course_id FROM public.{table} WHERE course_id = ANY(%s) "
+        "AND model_used = %s AND prompt_version = %s AND resource_prompt_version = %s"
+    ).format(table=sql.Identifier(ROLLUP_TABLE))
+    with connection, connection.cursor() as cursor:
+        cursor.execute(query, (course_ids, *(run_info[column] for column in RUN_COLUMNS)))
+        done = {row[0] for row in cursor.fetchall()}
+    if done:
+        logger.info("Skipping %d courses that already have a roll-up.", len(done))
+    return [course_id for course_id in course_ids if course_id not in done]
+
+
 def fetch_course_resources(
-    connection: Connection, course_id: str, run_info: RunInfo
+    connection: Connection,
+    course_id: str,
+    run_info: RunInfo,
+    mime_type: str | None = None,
+    resource_ids: list[str] | None = None,
 ) -> list[Resource]:
     """The resources of the course that have a transcript, each with its metadata from this
-    model and resource prompt version.
+    model and resource prompt version. With `mime_type`, only the resources of that type.
+
+    With `resource_ids`, those resources are the course: they are matched on resource_id alone,
+    whatever resource_transcripts.course_id says (a resource can be in several courses but that
+    column keeps only one of them). Without, the course's resources are the rows whose
+    resource_transcripts.course_id is `course_id`.
 
     Raises CourseSkippedError if there are none, or if any of them has no such metadata yet (the
     message lists the missing resource ids).
     """
     # Ids, duration and languages come from resource_transcripts; the metadata from
-    # resource_metadata_v2. A resource without metadata yet gets NULLs (LEFT JOIN).
+    # resource_metadata_<version>. A resource without metadata yet gets NULLs (LEFT JOIN).
     transcript_columns = ["resource_id", "duration_in_sec", "source_language", "source_languages"]
     columns = [*transcript_columns, *RESOURCE_COLUMNS]
     query = sql.SQL(
         "SELECT {columns} FROM public.resource_transcripts t {join_metadata} "
-        "WHERE t.course_id = %s AND {has_transcript} ORDER BY t.resource_id"
+        "WHERE {of_course} AND {has_transcript} {of_type} ORDER BY t.resource_id"
     ).format(
         columns=sql.SQL(", ").join(
             [sql.Identifier("t", column) for column in transcript_columns]
             + [sql.Identifier("m", column) for column in RESOURCE_COLUMNS]
         ),
         join_metadata=RESOURCE_METADATA_JOIN_SQL,
+        of_course=sql.SQL("t.resource_id = ANY(%s)" if resource_ids is not None else "t.course_id = %s"),
         has_transcript=HAS_TRANSCRIPT_SQL,
+        of_type=sql.SQL("AND t.mime_type = %s" if mime_type else ""),
+    )
+    parameters = (
+        *resource_metadata_join_parameters(run_info),
+        list(resource_ids) if resource_ids is not None else course_id,
+        *([mime_type] if mime_type else []),
     )
     with connection, connection.cursor() as cursor:
-        cursor.execute(query, (*resource_metadata_join_parameters(run_info), course_id))
+        cursor.execute(query, parameters)
         resources = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
 
     if not resources:
         raise CourseSkippedError("no resource with a transcript")
     missing = [
-        resource["resource_id"] for resource in resources if resource["course_summary"] is None
+        resource["resource_id"] for resource in resources if resource["description"] is None
     ]
     if missing:
         raise CourseSkippedError(
@@ -831,9 +874,16 @@ def order_like_learner_portal(course_id: str, resources: list[Resource]) -> list
     return ordered
 
 
-def prepare_course(connection: Connection, course_id: str, run_info: RunInfo) -> PreparedCourse:
-    """Read a course and do everything that needs no model."""
-    resources = fetch_course_resources(connection, course_id, run_info)
+def prepare_course(
+    connection: Connection,
+    course_id: str,
+    run_info: RunInfo,
+    mime_type: str | None = None,
+    resource_ids: list[str] | None = None,
+) -> PreparedCourse:
+    """Read a course and do everything that needs no model. With `mime_type` and/or
+    `resource_ids`, the course is rolled up from those of its resources only."""
+    resources = fetch_course_resources(connection, course_id, run_info, mime_type, resource_ids)
     resources = order_like_learner_portal(course_id, resources)
     normalise_durations(resources)
     return PreparedCourse(
@@ -843,7 +893,7 @@ def prepare_course(connection: Connection, course_id: str, run_info: RunInfo) ->
     )
 
 
-# --- Step 4: the keywords list (built from the model's keywords) ------------------------------
+# --- Step 4: the keywords (built from the model's keywords_list) ------------------------------
 
 
 def split_full_and_short_forms(keyword: Keyword) -> tuple[str, list[str]]:
@@ -869,15 +919,13 @@ def split_full_and_short_forms(keyword: Keyword) -> tuple[str, list[str]]:
 
 
 def format_keyword(keyword: Keyword) -> str:
-    """For example: "Quality of Service (QoS, QS) [High, 7 variants]"."""
+    """For example: "Quality of Service (QoS, QS)"."""
     full_form, short_forms = split_full_and_short_forms(keyword)
     short_text = f" ({', '.join(short_forms)})" if short_forms else ""
-    variant_count = len(keyword.variants)
-    plural = "" if variant_count == 1 else "s"
-    return f"{full_form}{short_text} [{keyword.importance}, {variant_count} variant{plural}]"
+    return f"{full_form}{short_text}"
 
 
-def build_keywords_list(keywords: list[Keyword]) -> list[str]:
+def build_keywords(keywords: list[Keyword]) -> list[str]:
     """Every keyword as one line: High first, then Medium, then Low (the model's order within)."""
     by_importance = sorted(keywords, key=lambda keyword: IMPORTANCE_ORDER[keyword.importance])
     return [format_keyword(keyword) for keyword in by_importance]
@@ -893,7 +941,7 @@ def build_course_metadata(
     return CourseMetadata(
         course_id=course_id,
         **rolled_up,
-        keywords_list=build_keywords_list(text.keywords),
+        keywords=build_keywords(text.keywords_list),
         **text.model_dump(),
     )
 
@@ -904,7 +952,7 @@ def build_course_metadata(
 def build_rollup_row(
     resource_info: dict[str, Any], metadata: CourseMetadata, run_info: RunInfo
 ) -> dict[str, Any]:
-    """The course_metadata_rollup_v2 row as JSON-ready values, keyed by column, in column order.
+    """The course_metadata_rollup_<version> row as JSON-ready values, keyed by column, in column order.
 
     run_info: the RUN_COLUMNS of this run (model, course and resource prompt versions).
     """
@@ -942,14 +990,19 @@ def save_rollup(connection: Connection, row: dict[str, Any]) -> None:
         cursor.execute(query, parameters)
 
 
-def rollup_file_path(row: dict[str, Any]) -> Path:
-    """<COURSE_METADATA_OUTPUT_DIR>/<model>_course-<version>_resource-<version>/<course_id>.json,
-    so a run with another model or prompt version never overwrites the files of an earlier one."""
-    run_dir = (
-        f"{row['model_used']}_course-{row['prompt_version']}"
-        f"_resource-{row['resource_prompt_version']}"
+def run_output_dir(run_info: RunInfo) -> Path:
+    """<COURSE_METADATA_OUTPUT_DIR>/<model>_course-<version>_resource-<version>: the files of one
+    model and pair of prompt versions, and the failed_*.txt id lists of its runs."""
+    return COURSE_METADATA_OUTPUT_DIR / (
+        f"{run_info['model_used']}_course-{run_info['prompt_version']}"
+        f"_resource-{run_info['resource_prompt_version']}"
     )
-    return COURSE_METADATA_OUTPUT_DIR / run_dir / f"{row['course_id']}.json"
+
+
+def rollup_file_path(row: dict[str, Any]) -> Path:
+    """<run_output_dir>/<course_id>.json, so a run with another model or prompt version never
+    overwrites the files of an earlier one."""
+    return run_output_dir(row) / f"{row['course_id']}.json"
 
 
 def save_rollup_file(row: dict[str, Any]) -> None:
@@ -962,44 +1015,58 @@ def save_rollup_file(row: dict[str, Any]) -> None:
 # --- Running ----------------------------------------------------------------------------------
 
 
-async def process_batch(
-    connection: Connection, llm: LLMClient, course_ids: list[str], run_info: RunInfo
-) -> int:
-    """Roll up one batch of courses. Returns how many were saved."""
-    courses: dict[str, PreparedCourse] = {}
+def prepare_courses(
+    connection: Connection, course_ids: list[str], run_info: RunInfo
+) -> dict[str, PreparedCourse | Exception]:
+    """Prepare each course. A skipped course is left out; one that could not be prepared (a
+    database error, or a bug in the roll-up) is its error, so it fails alone."""
+    courses: dict[str, PreparedCourse | Exception] = {}
     for course_id in course_ids:
         try:
             courses[course_id] = prepare_course(connection, course_id, run_info)
         except CourseSkippedError as error:
             logger.warning("Skipped %s: %s", course_id, error)
-        except psycopg2.Error:
-            logger.exception("Could not read %s", course_id)
-
-    prompts = [course.user_prompt for course in courses.values()]
-    results = await llm.agenerate_many(prompts, CourseTextMetadata)  # a failure is its exception
-
-    saved = 0
-    # Results come back in prompt order, so each one is mapped to its course by position.
-    for (course_id, course), result in zip(courses.items(), results, strict=True):
-        if isinstance(result, Exception):
-            logger.error("Text fields failed for %s: %r", course_id, result)
-            continue
-        try:
-            metadata = build_course_metadata(course_id, course.rolled_up, result)
-            row = build_rollup_row(course.resource_info, metadata, run_info)
-            # File first: if the database save fails, the billed response is still kept.
-            save_rollup_file(row)
-            save_rollup(connection, row)
-            saved += 1
-        except (ValidationError, psycopg2.Error, OSError):
-            logger.exception("Could not save %s", course_id)
-    return saved
+        except Exception as error:
+            logger.exception("Could not prepare %s", course_id)
+            courses[course_id] = error
+    return courses
 
 
-async def rollup_course_metadata(requested_ids: list[str] | None = None) -> None:
-    """Roll up and store course metadata. With no ids, process every course without a roll-up
-    from this model and these prompt versions."""
-    settings = load_llm_settings()
+async def process_course(
+    connection: Connection,
+    llm: LLMClient,
+    course_id: str,
+    course: PreparedCourse,
+    run_info: RunInfo,
+) -> None:
+    """Ask the model for the course's text fields, then build and save its roll-up. Raises if
+    either fails."""
+    text_fields = await llm.agenerate(course.user_prompt, CourseTextMetadata)
+    metadata = build_course_metadata(course_id, course.rolled_up, text_fields)
+    row = build_rollup_row(course.resource_info, metadata, run_info)
+    # File first: if the database save fails, the billed response is still kept.
+    save_rollup_file(row)
+    save_rollup(connection, row)
+
+
+async def rollup_course_metadata(
+    requested_ids: list[str] | None = None,
+    skip_done: bool = True,
+    *,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    concurrency: int | None = None,
+    limit: int | None = None,
+    model_env_var: str = DEFAULT_MODEL_ENV_VAR,
+) -> RunSummary:
+    """Roll up and store course metadata.
+
+    With ids, process those that have no roll-up yet from this model and these prompt versions
+    (all of them with skip_done=False, which replaces their stored roll-up). With None, process
+    every complete course without such a roll-up. `limit` caps how many are processed;
+    `concurrency` (default MAX_CONCURRENCY) how many model calls run at once.
+    """
+    settings = load_llm_settings(model_env_var)
+    concurrency = concurrency or settings.max_concurrency
     run_info = {
         "model_used": settings.model,
         "prompt_version": COURSE_PROMPTS.PROMPT_VERSION,
@@ -1008,34 +1075,69 @@ async def rollup_course_metadata(requested_ids: list[str] | None = None) -> None
     connection = psycopg2.connect(load_db_dsn())
     try:
         create_rollup_table(connection)
-        course_ids = requested_ids or find_pending_course_ids(connection, run_info)
-        total = len(course_ids)
-        if total == 0:
+        if requested_ids is None:
+            course_ids = find_pending_course_ids(connection, run_info)
+        elif skip_done:
+            course_ids = leave_out_done(connection, requested_ids, run_info)
+        else:
+            course_ids = list(requested_ids)
+        course_ids = course_ids[:limit] if limit else course_ids
+        if not course_ids:
             logger.info("No courses to process.")
-            return
+            return RunSummary()
         logger.info(
-            "Processing %d courses with %s, course prompt %s, resource rows of prompt %s",
-            total,
+            "Processing %d courses with %s, course prompt %s, resource rows of prompt %s: "
+            "%d calls at a time, batches of %d",
+            len(course_ids),
             run_info["model_used"],
             run_info["prompt_version"],
             run_info["resource_prompt_version"],
+            concurrency,
+            batch_size,
         )
 
         llm = LLMClient(
             GeminiProvider(settings, COURSE_PROMPTS.COURSE_METADATA_SYSTEM_PROMPT),
-            settings.max_concurrency,
+            concurrency,
+            settings.retry,
         )
 
-        saved = 0
-        for start in range(0, total, BATCH_SIZE):
-            batch = course_ids[start : start + BATCH_SIZE]
-            saved += await process_batch(connection, llm, batch, run_info)
-            logger.info("Progress: %d/%d processed, %d saved", start + len(batch), total, saved)
-        logger.info("Done. Saved the roll-up of %d of %d courses.", saved, total)
+        async def process_one(course_id: str, course: PreparedCourse) -> None:
+            await process_course(connection, llm, course_id, course, run_info)
+
+        summary = await run_pool(
+            course_ids,
+            lambda batch: prepare_courses(connection, batch, run_info),
+            process_one,
+            concurrency=concurrency,
+            batch_size=batch_size,
+            label="courses",
+        )
+        retry_file = write_retry_file(summary, run_output_dir(run_info))
+        log_summary(summary, "courses", retry_file)
+        return summary
     finally:
         connection.close()
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser(
+        "Roll up resource metadata into course metadata.", DEFAULT_BATCH_SIZE, "courses"
+    )
+    args = parse_args(parser, argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    asyncio.run(rollup_course_metadata(COURSE_IDS))
+    summary = asyncio.run(
+        rollup_course_metadata(
+            selected_ids(args, "course_id"),
+            skip_done=not args.force,
+            batch_size=args.batch_size,
+            concurrency=args.concurrency,
+            limit=args.limit,
+            model_env_var=args.model_env,
+        )
+    )
+    return summary.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

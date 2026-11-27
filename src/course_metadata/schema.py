@@ -1,13 +1,13 @@
 """Output schema for course-level metadata (the roll-up of resource-level metadata).
 
 CourseMetadata has the fields of ResourceMetadata (src/resource_metadata/schema.py), with
-`course_id` in place of `resource_id`, plus `keywords_list`. Unlike a resource, a course has
+`course_id` in place of `resource_id`, plus `keywords`. Unlike a resource, a course has
 competencies from ONE area: the field of its primary area holds 1 to COURSE_MAX_ITEMS of them
 (src/config.py), and the other two competency fields are `[]`. A Domain competency of a course
 always has its `theme`.
 
 The `model_used`, `prompt_version`, `resource_ids`, `language` and `list_of_languages` columns of
-course_metadata_rollup_v2 are added by code, so they are not part of this schema.
+course_metadata_rollup_<version> are added by code, so they are not part of this schema.
 
 CourseTextMetadata mirrors Section 4 of COURSE_METADATA_SYSTEM_PROMPT in src/prompts.py.
 Keep the two in sync.
@@ -48,10 +48,10 @@ class CourseDomainCompetency(DomainCompetency):
 class CourseTextMetadata(BaseModel):
     """The course fields the model writes. Code decides every other CourseMetadata field."""
 
+    course_coverage: str
     description: str
-    course_summary: str
     learning_outcomes: list[str]
-    keywords: list[Keyword]
+    keywords_list: list[Keyword]
     prerequisites: list[Prerequisite]
     responsibilities_addressed: list[str]
     activities_enabled: list[str]
@@ -66,11 +66,11 @@ class CourseMetadata(BaseModel):
 
     course_id: str
     presenters: list[Presenter]
+    course_coverage: str
     description: str
-    course_summary: str
     learning_outcomes: list[str]
-    keywords: list[Keyword]
-    keywords_list: list[str]  # built by code from `keywords`, see build_keywords_list
+    keywords_list: list[Keyword]
+    keywords: list[str]  # built by code from `keywords_list`, see build_keywords
     reference_resources: list[ReferenceResource]
     learning_level: LearningLevel
     learning_mode: LearningMode

@@ -1,28 +1,83 @@
 """LLM client: send a user message, get back a validated Pydantic object.
 
     provider = GeminiProvider(settings, system_prompt)
-    llm = LLMClient(provider, settings.max_concurrency)
+    llm = LLMClient(provider, settings.max_concurrency, settings.retry)
 
     result = llm.generate(user_message, ResourceMetadata)
     results = await llm.agenerate_many(user_messages, ResourceMetadata)
+
+LLMClient retries the failures that can go away (quota, server errors, timeouts, an empty or
+off-schema answer) as RetryPolicy in src/config.py says. When the quota stays exhausted it raises
+QuotaExhaustedError, for this call and every later one, so the run can stop.
 
 To use another vendor, write a class with the two methods of `LLMProvider`.
 """
 
 import asyncio
 import logging
+import random
 import threading
+import time
+from collections import Counter
 from typing import Protocol, Sequence, TypeVar
 
 from google import genai
 from google.genai import errors, types
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from src.config import LLMSettings
+from src.config import LLMSettings, RetryPolicy
+
+try:  # the HTTP library google-genai sends requests with
+    import httpx2
+
+    NETWORK_ERRORS: tuple[type[Exception], ...] = (TimeoutError, ConnectionError, httpx2.TransportError)
+except ImportError:  # pragma: no cover - another google-genai version
+    NETWORK_ERRORS = (TimeoutError, ConnectionError)
 
 logger = logging.getLogger(__name__)
 
 Output = TypeVar("Output", bound=BaseModel)
+
+QUOTA_STATUS_CODE = 429
+# Request timeout, quota, and server errors: asking again later can work.
+RETRYABLE_STATUS_CODES = frozenset({408, QUOTA_STATUS_CODE, 500, 502, 503, 504})
+
+# What went wrong with a call, for deciding whether and how to retry it.
+QUOTA = "quota"
+TRANSIENT = "transient"
+INVALID_ANSWER = "invalid answer"
+
+
+class InvalidResponseError(ValueError):
+    """The model's answer was empty or did not match the output model."""
+
+
+class QuotaExhaustedError(Exception):
+    """The model quota stayed exhausted through every retry. Stop the run; a later run carries on."""
+
+
+def classify_failure(error: Exception) -> str | None:
+    """QUOTA, TRANSIENT or INVALID_ANSWER for a failure worth retrying; None for any other."""
+    if isinstance(error, errors.APIError):
+        if error.code == QUOTA_STATUS_CODE:
+            return QUOTA
+        return TRANSIENT if error.code in RETRYABLE_STATUS_CODES else None
+    if isinstance(error, NETWORK_ERRORS):
+        return TRANSIENT
+    if isinstance(error, InvalidResponseError):
+        return INVALID_ANSWER
+    return None
+
+
+# Replaced in tests, so that no test really waits.
+_now = time.monotonic
+_sleep = time.sleep
+_asleep = asyncio.sleep
+
+
+def _jitter() -> float:
+    """A random factor for a wait, so that calls paused together do not all retry at once."""
+    return random.uniform(0.8, 1.2)
 
 
 class LLMProvider(Protocol):
@@ -49,7 +104,8 @@ class GeminiProvider:
             location=settings.location,
             http_options=types.HttpOptions(
                 timeout=settings.timeout_seconds * 1000,
-                retry_options=types.HttpRetryOptions(attempts=settings.max_attempts),
+                # One attempt: LLMClient does the retrying, with longer waits than the SDK's.
+                retry_options=types.HttpRetryOptions(attempts=1),
             ),
         )
         self._renew_lock = threading.Lock()
@@ -152,19 +208,130 @@ class GeminiProvider:
 
 
 class LLMClient:
-    """Calls a provider and validates its answer against a Pydantic model."""
+    """Calls a provider, validates its answer against a Pydantic model, and retries the failures
+    that can go away (see RetryPolicy).
 
-    def __init__(self, provider: LLMProvider, max_concurrency: int = 4):
+    A quota error (429) pauses every call made through this client until its wait is over, so
+    calls running together do not keep hitting the exhausted quota. When `quota_give_up_after`
+    requests in a row have used every attempt on quota errors, the client raises
+    QuotaExhaustedError, and from then on raises it for every call without calling the model.
+    """
+
+    def __init__(
+        self, provider: LLMProvider, max_concurrency: int = 4, retry: RetryPolicy | None = None
+    ):
         self.provider = provider
         self.max_concurrency = max_concurrency
+        self.retry = retry or RetryPolicy()
+        self.quota_exhausted = False
+        self._paused_until = 0.0  # no call starts before this _now() time (set by a 429)
+        self._quota_give_ups = 0  # requests in a row that used every attempt on quota errors
 
     def generate(self, user_message: str, output_model: type[Output]) -> Output:
-        text = self.provider.generate(user_message, output_model.model_json_schema())
-        return self._parse(text, output_model)
+        json_schema = output_model.model_json_schema()
+        failures: Counter[str] = Counter()
+        attempt = 0
+        while True:
+            self._wait_out_pause_sync()
+            attempt += 1
+            try:
+                result = self._parse(self.provider.generate(user_message, json_schema), output_model)
+            except Exception as error:
+                delay = self._retry_delay(error, attempt, failures)
+                if delay is None:
+                    raise
+                _sleep(delay)
+                continue
+            self._quota_give_ups = 0
+            return result
 
     async def agenerate(self, user_message: str, output_model: type[Output]) -> Output:
-        text = await self.provider.agenerate(user_message, output_model.model_json_schema())
-        return self._parse(text, output_model)
+        json_schema = output_model.model_json_schema()
+        failures: Counter[str] = Counter()
+        attempt = 0
+        while True:
+            await self._wait_out_pause()
+            attempt += 1
+            try:
+                text = await self.provider.agenerate(user_message, json_schema)
+                result = self._parse(text, output_model)
+            except Exception as error:
+                delay = self._retry_delay(error, attempt, failures)
+                if delay is None:
+                    raise
+                await _asleep(delay)
+                continue
+            self._quota_give_ups = 0
+            return result
+
+    # --- Retrying --------------------------------------------------------------------------
+
+    def _pause_left(self) -> float:
+        """Seconds until calls may start again; raises QuotaExhaustedError once given up."""
+        if self.quota_exhausted:
+            raise QuotaExhaustedError("The model quota is exhausted; not calling the model.")
+        return max(0.0, self._paused_until - _now())
+
+    def _wait_out_pause_sync(self) -> None:
+        while (left := self._pause_left()) > 0:
+            _sleep(left)
+
+    async def _wait_out_pause(self) -> None:
+        # Checked again after each wait: another call may have made the pause longer.
+        while (left := self._pause_left()) > 0:
+            await _asleep(left)
+
+    def _retry_delay(self, error: Exception, attempt: int, failures: Counter[str]) -> float | None:
+        """Seconds to wait before trying again, or None if `error` must be raised as it is.
+
+        Raises QuotaExhaustedError when this request makes `quota_give_up_after` in a row that
+        used every attempt on quota errors.
+        """
+        kind = classify_failure(error)
+        if kind is None:
+            return None
+        failures[kind] += 1
+        out_of_attempts = attempt >= self.retry.attempts or (
+            kind == INVALID_ANSWER and failures[kind] >= self.retry.invalid_response_attempts
+        )
+        if out_of_attempts:
+            logger.warning("Giving up after %d attempts: %s", attempt, describe(error))
+            if kind == QUOTA:
+                self._count_quota_give_up(error)
+            return None
+
+        delay = self._backoff(attempt)
+        if kind == QUOTA:
+            self._paused_until = max(self._paused_until, _now() + delay)
+            logger.warning(
+                "Quota exhausted (429): pausing every call for %.0fs (attempt %d of %d).",
+                delay,
+                attempt,
+                self.retry.attempts,
+            )
+            return 0.0  # the shared pause is waited out before the next attempt
+        logger.warning(
+            "%s. Retrying in %.0fs (attempt %d of %d).",
+            describe(error),
+            delay,
+            attempt,
+            self.retry.attempts,
+        )
+        return delay
+
+    def _backoff(self, attempt: int) -> float:
+        """initial_delay, doubled after each attempt, with jitter, at most max_delay."""
+        delay = self.retry.initial_delay_seconds * 2 ** (attempt - 1) * _jitter()
+        return min(self.retry.max_delay_seconds, delay)
+
+    def _count_quota_give_up(self, error: Exception) -> None:
+        self._quota_give_ups += 1
+        if self._quota_give_ups >= self.retry.quota_give_up_after:
+            self.quota_exhausted = True
+            raise QuotaExhaustedError(
+                f"{self._quota_give_ups} requests in a row failed on quota after "
+                f"{self.retry.attempts} attempts each."
+            ) from error
 
     def generate_many(self, user_messages: Sequence[str], output_model: type[Output]) -> list[Output | Exception]:
         """One at a time. A failed message gives its exception; the rest still run."""
@@ -191,5 +358,16 @@ class LLMClient:
     @staticmethod
     def _parse(text: str | None, output_model: type[Output]) -> Output:
         if not text:
-            raise ValueError("The model returned no text.")
-        return output_model.model_validate_json(text)
+            raise InvalidResponseError("The model returned no text.")
+        try:
+            return output_model.model_validate_json(text)
+        except ValidationError as error:
+            raise InvalidResponseError(
+                f"The answer does not match {output_model.__name__}: {error}"
+            ) from error
+
+
+def describe(error: Exception, limit: int = 300) -> str:
+    """A one-line description of `error` for the log."""
+    text = " ".join(f"{type(error).__name__}: {error}".split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."

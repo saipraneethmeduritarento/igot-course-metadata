@@ -13,7 +13,7 @@ from src.course_metadata.extraction import (
     CourseSkippedError,
     TEXT_FIELDS,
     build_course_metadata,
-    build_keywords_list,
+    build_keywords,
     build_rollup_row,
     build_user_prompt,
     collect_languages,
@@ -51,7 +51,7 @@ def resource(resource_id, duration, area="Domain", level="Operational", **overri
     """A resource with complete metadata (a Domain path by default). Pass fields to override."""
     row = {
         "resource_id": resource_id, "duration_in_sec": duration, "source_language": None, "source_languages": None,
-        "presenters": [], "course_summary": "summary", "description": "d", "learning_outcomes": [], "keywords": [], "reference_resources": [],
+        "presenters": [], "course_coverage": "d", "description": "summary", "learning_outcomes": [], "keywords_list": [], "reference_resources": [],
         "learning_level": judged("Beginner"), "learning_mode": judged("Online"),
         "prerequisites": [], "bloom_taxonomy": [],
         "primary_competency_area": judged(area),
@@ -67,7 +67,7 @@ def resource(resource_id, duration, area="Domain", level="Operational", **overri
 
 def minimal_text():
     return CourseTextMetadata(
-        description="d", course_summary="s", learning_outcomes=[], keywords=[], prerequisites=[],
+        course_coverage="d", description="s", learning_outcomes=[], keywords_list=[], prerequisites=[],
         responsibilities_addressed=[], activities_enabled=[],
     )
 
@@ -82,7 +82,7 @@ def test_prompt_example_matches_text_schema_and_key_order():
 
 def test_code_and_text_fields_cover_every_course_field():
     rolled_up = roll_up_resources([resource("a", 100)])
-    built_after_the_model = {"keywords_list"}
+    built_after_the_model = {"keywords"}
     assert set(rolled_up) | set(TEXT_FIELDS) | built_after_the_model | {"course_id"} == set(CourseMetadata.model_fields)
     assert COURSE_COLUMNS == [n for n in CourseMetadata.model_fields if n != "course_id"]
 
@@ -491,14 +491,14 @@ def test_user_prompt_sends_only_the_resources_text_fields():
 def test_build_course_metadata_joins_code_and_text_fields():
     resources = [resource("a", 100)]
     text = CourseTextMetadata(
-        course_summary="s", description="d", learning_outcomes=[],
-        keywords=[], prerequisites=[],
+        description="s", course_coverage="d", learning_outcomes=[],
+        keywords_list=[], prerequisites=[],
         responsibilities_addressed=[], activities_enabled=[],
     )
     metadata = build_course_metadata("c1", roll_up_resources(resources), text)
     assert metadata.course_id == "c1"
     assert metadata.primary_competency_area.value == "Domain"
-    assert metadata.course_summary == "s"
+    assert metadata.description == "s"
 
 
 RUN_INFO = {"model_used": "gemini-test", "prompt_version": "v9", "resource_prompt_version": "v8"}
@@ -520,40 +520,40 @@ def test_rollup_file_is_kept_per_model_and_prompt_versions():
 
 def test_create_table_has_the_run_columns_in_its_primary_key():
     text = repr(CREATE_TABLE_SQL)  # a psycopg2 Composed; its repr holds the literal SQL parts
-    assert "course_metadata_rollup_v2" in text
+    assert f"course_metadata_rollup_{COURSE_PROMPT_VERSION.replace('.', '_')}" in text
     assert "PRIMARY KEY (course_id, model_used, prompt_version, resource_prompt_version)" in text
 
 
 def test_every_prompt_module_has_its_own_version_and_the_configured_one_is_used():
-    assert set(PROMPT_MODULES) == {"v1", "v2"}
+    assert set(PROMPT_MODULES) == {"v1", "v2", "v3", "v3.1"}
     assert COURSE_PROMPTS is prompts_for(COURSE_PROMPT_VERSION)
     with pytest.raises(ValueError, match="Unknown prompt version 'v0'"):
         prompts_for("v0")
 
 
-# --- keywords_list, rationales and field order -------------------------------------------------
+# --- keywords, rationales and field order ------------------------------------------------------
 
 
 def keyword(name, importance, variants):
     return Keyword(keyword=name, type="Concept", importance=importance, variants=variants)
 
 
-def test_keywords_list_is_sorted_by_importance_with_short_forms_and_variant_counts():
+def test_keywords_are_sorted_by_importance_with_short_forms():
     keywords = [
         keyword("phishing", "Low", ["phishing"]),
         keyword("Quality of Service", "High", ["quality of service", "QoS", "QS", "QOS"]),
         keyword("QoS flow", "Medium", ["QoS flow", "QoS flows"]),
     ]
-    assert build_keywords_list(keywords) == [
-        "Quality of Service (QoS, QS) [High, 4 variants]",
-        "QoS flow [Medium, 2 variants]",
-        "phishing [Low, 1 variant]",
+    assert build_keywords(keywords) == [
+        "Quality of Service (QoS, QS)",
+        "QoS flow",
+        "phishing",
     ]
 
 
-def test_keywords_list_uses_the_expanded_form_when_the_keyword_is_an_acronym():
+def test_keywords_use_the_expanded_form_when_the_keyword_is_an_acronym():
     keywords = [keyword("NCRP", "High", ["NCRP", "National Cybercrime Reporting Portal", "Cybercrime Portal"])]
-    assert build_keywords_list(keywords) == ["National Cybercrime Reporting Portal (NCRP) [High, 3 variants]"]
+    assert build_keywords(keywords) == ["National Cybercrime Reporting Portal (NCRP)"]
 
 
 def test_rationale_quotes_the_strongest_resources_content():
@@ -580,7 +580,7 @@ def test_hybrid_rationale_quotes_both_parts():
 def test_rationale_comes_before_value_and_confidence():
     resources = [resource("a", 100, area="Functional", functional_competencies=[kcm("F1")])]
     text = CourseTextMetadata(
-        course_summary="s", description="d", learning_outcomes=[], keywords=[],
+        description="s", course_coverage="d", learning_outcomes=[], keywords_list=[],
         prerequisites=[{"topic": "t", "recommended_by": "AI", "confidence": 0.8, "rationale": "r"}],
         responsibilities_addressed=[], activities_enabled=[],
     )
@@ -611,6 +611,7 @@ class FakeConnection:
         return self
 
     def execute(self, query, params):
+        self.query = query
         self.params = params
 
     def fetchall(self):
@@ -623,7 +624,7 @@ def test_complete_course_is_fetched():
 
 
 def test_course_with_a_resource_missing_metadata_is_skipped_and_lists_the_missing_ids():
-    resources = [resource("a", 100), resource("b", 200, course_summary=None), resource("c", 50, course_summary=None)]
+    resources = [resource("a", 100), resource("b", 200, description=None), resource("c", 50, description=None)]
     with pytest.raises(CourseSkippedError, match=r"2 of 3 resources have no metadata yet: b, c"):
         fetch_course_resources(FakeConnection(resources), "c1", RUN_INFO)
 
@@ -637,3 +638,142 @@ def test_resource_metadata_is_read_for_the_runs_model_and_resource_prompt_versio
     connection = FakeConnection([resource("a", 100)])
     fetch_course_resources(connection, "c1", RUN_INFO)
     assert connection.params == ("gemini-test", "v8", "c1")
+
+
+def test_a_mime_type_limits_the_course_to_resources_of_that_type():
+    connection = FakeConnection([resource("a", 100)])
+    fetch_course_resources(connection, "c1", RUN_INFO, "video/mp4")
+    assert connection.params == ("gemini-test", "v8", "c1", "video/mp4")
+    assert "mime_type" in repr(connection.query)
+
+
+def test_resource_ids_are_the_course_whatever_course_resource_transcripts_files_them_under():
+    # A resource reused by a program can be stored under the program's id, not the course's.
+    connection = FakeConnection([resource("a", 100)])
+    fetch_course_resources(connection, "c1", RUN_INFO, "video/mp4", ["a", "b"])
+    assert connection.params == ("gemini-test", "v8", ["a", "b"], "video/mp4")
+    assert "resource_id = ANY" in repr(connection.query)
+    assert "course_id" not in repr(connection.query)
+
+
+def test_without_resource_ids_the_course_is_read_by_its_id():
+    connection = FakeConnection([resource("a", 100)])
+    fetch_course_resources(connection, "c1", RUN_INFO)
+    assert "course_id" in repr(connection.query)
+    assert "resource_id = ANY" not in repr(connection.query)
+
+
+def test_without_a_mime_type_every_resource_type_is_read():
+    connection = FakeConnection([resource("a", 100)])
+    fetch_course_resources(connection, "c1", RUN_INFO)
+    assert "mime_type" not in repr(connection.query)
+
+
+# --- running: rollup_course_metadata with fakes ------------------------------------------------
+
+import asyncio  # noqa: E402
+
+from src.config import RetryPolicy  # noqa: E402
+from src.course_metadata import extraction  # noqa: E402
+from src.course_metadata.extraction import PreparedCourse  # noqa: E402
+from src.llm import QuotaExhaustedError  # noqa: E402
+
+
+class DoneConnection:
+    """A connection whose query says these course ids already have a roll-up."""
+
+    def __init__(self, done):
+        self.done = done
+        self.params = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def cursor(self):
+        return self
+
+    def execute(self, query, params):
+        self.params = params
+
+    def fetchall(self):
+        return [(course_id,) for course_id in self.done]
+
+    def close(self):
+        pass
+
+
+def test_leave_out_done_drops_courses_rolled_up_by_this_run_and_keeps_the_order():
+    connection = DoneConnection(["c2"])
+    assert extraction.leave_out_done(connection, ["c1", "c2", "c3"], RUN_INFO) == ["c1", "c3"]
+    assert connection.params == (["c1", "c2", "c3"], "gemini-test", "v9", "v8")
+
+
+class FakeCourseLLM:
+    """Answers every course; "c_bad" fails and "c_quota" raises QuotaExhaustedError."""
+
+    async def agenerate(self, user_prompt, output_model):
+        await asyncio.sleep(0)
+        if user_prompt == "c_bad":
+            raise RuntimeError("model failed")
+        if user_prompt == "c_quota":
+            raise QuotaExhaustedError("quota gone")
+        return minimal_text()
+
+
+@pytest.fixture
+def course_run(monkeypatch, tmp_path):
+    """Replace the database, the content API, the model and the saves; record saved courses."""
+    saved = []
+
+    def fake_prepare(connection, course_id, run_info):
+        if course_id == "c_incomplete":
+            raise CourseSkippedError("1 of 2 resources have no metadata yet")
+        if course_id == "c_broken":
+            raise KeyError("a bug in the roll-up")
+        return PreparedCourse(resource_info={}, rolled_up={}, user_prompt=course_id)
+
+    settings = type("S", (), {"max_concurrency": 2, "model": "gemini-test", "retry": RetryPolicy()})()
+    monkeypatch.setattr(extraction, "load_llm_settings", lambda model_env_var: settings)
+    monkeypatch.setattr(extraction.psycopg2, "connect", lambda dsn: DoneConnection(["c_done"]))
+    monkeypatch.setattr(extraction, "load_db_dsn", lambda: "dsn")
+    monkeypatch.setattr(extraction, "create_rollup_table", lambda connection: None)
+    monkeypatch.setattr(extraction, "prepare_course", fake_prepare)
+    monkeypatch.setattr(extraction, "GeminiProvider", lambda settings, system_prompt: None)
+    monkeypatch.setattr(extraction, "LLMClient", lambda provider, concurrency, retry: FakeCourseLLM())
+    monkeypatch.setattr(extraction, "build_course_metadata", lambda course_id, rolled_up, text: course_id)
+    monkeypatch.setattr(extraction, "build_rollup_row", lambda info, metadata, run_info: {"course_id": metadata})
+    monkeypatch.setattr(extraction, "save_rollup_file", lambda row: None)
+    monkeypatch.setattr(extraction, "save_rollup", lambda connection, row: saved.append(row["course_id"]))
+    monkeypatch.setattr(extraction, "COURSE_METADATA_OUTPUT_DIR", tmp_path)
+    return saved
+
+
+def roll_up(ids, **options):
+    return asyncio.run(extraction.rollup_course_metadata(ids, **options))
+
+
+def test_course_run_skips_done_courses_and_survives_skips_and_failures(course_run, tmp_path):
+    ids = ["c1", "c_done", "c_incomplete", "c_broken", "c_bad", "c2"]
+    summary = roll_up(ids, batch_size=2)
+
+    assert sorted(course_run) == ["c1", "c2"]  # c_done was rolled up by an earlier run
+    assert summary.skipped == ["c_incomplete"]
+    assert sorted(summary.failed) == ["c_bad", "c_broken"]
+    [retry_file] = tmp_path.glob("*/failed_*.txt")
+    assert sorted(retry_file.read_text().split()) == ["c_bad", "c_broken"]
+
+
+def test_course_run_with_force_redoes_done_courses(course_run):
+    roll_up(["c1", "c_done"], skip_done=False)
+    assert sorted(course_run) == ["c1", "c_done"]
+
+
+def test_course_run_stops_when_the_quota_is_exhausted(course_run):
+    summary = roll_up(["c1", "c_quota", "c2", "c3"], batch_size=1, concurrency=1)
+    assert course_run == ["c1"]
+    assert summary.stopped_on_quota
+    assert summary.to_retry == ["c_quota", "c2", "c3"]
+    assert summary.exit_code == 1
